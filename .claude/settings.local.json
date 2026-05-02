@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(timeout 3 cargo run)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(timeout 10 cargo run)"
+    ]
+  }
+}
