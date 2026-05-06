@@ -111,30 +111,35 @@ pub fn run_dashboard(
                 row1[1],
             );
 
-            let hc = if stats.human_drift_p99 < 2.0 { Color::Green } else { Color::Red };
-            let bc = if stats.bot_drift_p99   < 2.0 { Color::Green } else { Color::Yellow };
+            // Scheduling drift = dequeue → task complete (Component C metric).
+            // Green when p99 < 2ms (within deadline), Red when deadline is being missed.
+            let dc = if stats.drift_p99 < 2.0 { Color::Green } else { Color::Red };
             let latency_text = vec![
                 Line::from(Span::styled(
-                    format!(" Human p50: {:.2}ms", stats.human_drift_p50),
-                    Style::default().fg(hc),
+                    format!(" Drift p50: {:.3}ms", stats.drift_p50),
+                    Style::default().fg(dc),
                 )),
                 Line::from(Span::styled(
-                    format!(" Human p90: {:.2}ms", stats.human_drift_p90),
-                    Style::default().fg(hc),
+                    format!(" Drift p90: {:.3}ms", stats.drift_p90),
+                    Style::default().fg(dc),
                 )),
                 Line::from(Span::styled(
-                    format!(" Human p99: {:.2}ms", stats.human_drift_p99),
-                    Style::default().fg(hc),
+                    format!(" Drift p99: {:.3}ms", stats.drift_p99),
+                    Style::default().fg(dc),
                 )),
                 Line::from(Span::styled(
-                    format!(" Bot   p99: {:.2}ms", stats.bot_drift_p99),
-                    Style::default().fg(bc),
+                    " Deadline:  2.000ms",
+                    Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(format!(" Misses:   {}", stats.deadline_misses)),
+                Line::from(Span::styled(
+                    format!(" C-Block:  {}", stats.comp_c_rejections),
+                    Style::default().fg(Color::Yellow),
+                )),
             ];
             f.render_widget(
                 Paragraph::new(latency_text)
-                    .block(Block::default().title(" LATENCY MONITOR ").borders(Borders::ALL)),
+                    .block(Block::default().title(" SCHED DRIFT (dequeue→done) ").borders(Borders::ALL)),
                 row1[2],
             );
 

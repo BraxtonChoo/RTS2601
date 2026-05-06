@@ -1,12 +1,15 @@
 // Component C: Scheduler and drift tracker
 //
-// Drift  = time an event spends waiting in PriorityChannel (enqueued_at → pop).
-// Deadline = end-to-end processing time from pop to leaderboard update (≤ 2ms).
-//            Tracked in the main processor loop via process_start.
+// Scheduling Drift = time from dequeue (pop) to task completion (leaderboard update).
+// Expected: ≤ 2ms.  Drift > 2ms → deadline miss.
+//
+// Queue-wait (secondary metric) = time packet spent inside PriorityChannel
+// (enqueued_at → dequeue).  Logged per-event as qwait= but NOT used for the
+// 2ms deadline comparison — only scheduling drift counts.
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant};  // Instant kept for last_log / last_h_p99 tracking
 
 use crate::channel::PriorityChannel;
 use crate::types::{EventStatus, PrioritisedEvent, PushResult, RecentEvent, SharedState};
@@ -38,15 +41,16 @@ impl DriftTracker {
         }
     }
 
-    // Returns drift_us so callers can include it in [DEADLINE MISS] context.
-    pub fn record(&mut self, enqueued_at: Instant, is_bot: bool) -> f64 {
-        let drift_us = enqueued_at.elapsed().as_micros() as f64;
+    // process_us: time from dequeue to task completion (scheduling drift, µs).
+    // Pass process_start.elapsed().as_micros() as f64 AFTER all processing is done.
+    // Returns the same value so callers can use it for deadline checks / logging.
+    pub fn record(&mut self, process_us: f64, is_bot: bool) -> f64 {
         if is_bot {
-            self.bot_samples.push(drift_us);
+            self.bot_samples.push(process_us);
         } else {
-            self.human_samples.push(drift_us);
+            self.human_samples.push(process_us);
         }
-        drift_us
+        process_us
     }
 
     pub fn percentile(samples: &mut Vec<f64>, pct: f64) -> f64 {
@@ -82,6 +86,13 @@ impl DriftTracker {
             s.bot_drift_p50   = Self::percentile(&mut self.bot_samples,   50.0) / 1000.0;
             s.bot_drift_p90   = Self::percentile(&mut self.bot_samples,   90.0) / 1000.0;
             s.bot_drift_p99   = Self::percentile(&mut self.bot_samples,   99.0) / 1000.0;
+
+            // Unified scheduling drift across all event types — used by dashboard
+            let mut all = self.human_samples.clone();
+            all.extend_from_slice(&self.bot_samples);
+            s.drift_p50 = Self::percentile(&mut all, 50.0) / 1000.0;
+            s.drift_p90 = Self::percentile(&mut all, 90.0) / 1000.0;
+            s.drift_p99 = Self::percentile(&mut all, 99.0) / 1000.0;
         }
 
         if self.last_log.elapsed() >= Duration::from_secs(10) {
@@ -107,7 +118,7 @@ impl DriftTracker {
             self.last_b_p99 = b99;
 
             tracing::info!(
-                "[DRIFT 10s] human p50={:.2}ms p90={:.2}ms p99={:.2}ms misses={} trend={}  |  bot p50={:.2}ms p90={:.2}ms p99={:.2}ms misses={} trend={}",
+                "[DRIFT 10s] sched_drift(dequeue→done)  human p50={:.3}ms p90={:.3}ms p99={:.3}ms misses={} trend={}  |  bot p50={:.3}ms p90={:.3}ms p99={:.3}ms misses={} trend={}",
                 h50/1000.0, h90/1000.0, h99/1000.0, h_miss, h_trend,
                 b50/1000.0, b90/1000.0, b99/1000.0, b_miss, b_trend
             );
@@ -119,7 +130,7 @@ impl DriftTracker {
                 let miss_rate = total_misses as f64 / total as f64 * 100.0;
                 if miss_rate > 25.0 {
                     tracing::warn!(
-                        "[DRIFT ALERT] {:.1}% of events exceeded 2ms queue wait  human_misses={}  bot_misses={}  — processor may be falling behind ingestion rate",
+                        "[DRIFT ALERT] {:.1}% of events exceeded 2ms scheduling deadline  human_misses={}  bot_misses={}  — system under high load",
                         miss_rate, h_miss, b_miss
                     );
                 }

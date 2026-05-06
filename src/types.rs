@@ -85,6 +85,14 @@ pub struct SystemStats {
     pub bot_drift_p90:   f64,
     pub bot_drift_p99:   f64,
 
+    // Unified scheduling drift (dequeue → task complete) — used by dashboard
+    pub drift_p50: f64,
+    pub drift_p90: f64,
+    pub drift_p99: f64,
+
+    // Component C: bot packets blocked from overwriting a human's last edit
+    pub comp_c_rejections: u64,
+
     pub recent_events: VecDeque<RecentEvent>,
 }
 

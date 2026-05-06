@@ -85,33 +85,75 @@ impl BenchLeaderboard {
 }
 
 // ============================================================
-// BENCHMARK 1: Scheduling Drift — Priority vs FIFO (Component C)
+// BENCHMARK 1: Scheduling Drift — Component C priority-after-dequeue (Component C)
+//
+// Measures scheduling drift = time from dequeue to task completion,
+// comparing two strategies:
+//
+//  priority_comp_c  — bots are rejected when the domain's last edit was human.
+//                     Simulates the production Component C check.
+//  fifo_no_priority — every event is processed unconditionally (baseline).
+//
+// Expected result: priority_comp_c has lower per-event latency because some
+// bot events are short-circuited early; human edits are never blocked.
 // ============================================================
 fn bench_scheduling_drift(c: &mut Criterion) {
     let mut group = c.benchmark_group("scheduling_drift");
+    group.measurement_time(Duration::from_secs(10));
 
-    group.bench_function("priority_human_first", |b| {
+    // Three domains to exercise the HashMap lookup on different keys
+    const DOMAINS: [&str; 3] = ["en.wikipedia.org", "de.wikipedia.org", "fr.wikipedia.org"];
+
+    // Component C: priority-after-dequeue with bot-overwrite protection
+    group.bench_function("priority_comp_c", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let mut human_q: VecDeque<Instant> = VecDeque::new();
-                let mut bot_q: VecDeque<Instant>   = VecDeque::new();
-                for _ in 0..80 { bot_q.push_back(Instant::now()); }
-                for _ in 0..20 { human_q.push_back(Instant::now()); }
-                while let Some(t) = human_q.pop_front() { total += t.elapsed(); }
-                while let Some(t) = bot_q.pop_front()   { total += t.elapsed(); }
+            // Reset per iter_custom call so state doesn't accumulate across warmup
+            let mut last_editor_bot: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            let mut lb = BenchLeaderboard::new();
+
+            for i in 0..iters {
+                let is_bot = (i % 4) != 0;                        // 75% bots, 25% human
+                let domain = DOMAINS[(i as usize) % DOMAINS.len()];
+
+                // --- dequeue time: scheduling drift starts here ---
+                let dequeue_time = Instant::now();
+
+                // Component C check: block bot if last edit on this domain was human
+                let last_was_human = last_editor_bot
+                    .get(domain)
+                    .map(|&bot| !bot)
+                    .unwrap_or(false);
+
+                if is_bot && last_was_human {
+                    // Rejected — task complete (no leaderboard update)
+                    total += dequeue_time.elapsed();
+                    continue;
+                }
+
+                // Allowed — update leaderboard and record last editor
+                lb.update(domain);
+                last_editor_bot.insert(domain.to_string(), is_bot);
+                total += dequeue_time.elapsed();
             }
             total
         })
     });
 
+    // Baseline: FIFO — process every event unconditionally, no priority check
     group.bench_function("fifo_no_priority", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
-            for _ in 0..iters {
-                let mut queue: VecDeque<Instant> = VecDeque::new();
-                for _ in 0..100 { queue.push_back(Instant::now()); }
-                while let Some(t) = queue.pop_front() { total += t.elapsed(); }
+            let mut lb = BenchLeaderboard::new();
+
+            for i in 0..iters {
+                let domain = DOMAINS[(i as usize) % DOMAINS.len()];
+
+                // --- dequeue time ---
+                let dequeue_time = Instant::now();
+                lb.update(domain);
+                total += dequeue_time.elapsed();
             }
             total
         })
@@ -177,7 +219,7 @@ fn bench_sync_contention(c: &mut Criterion) {
 //   Async model:    tokio tasks push events; tokio task pops + processes.
 //   Threaded model: std::threads push events; std::thread pops + processes.
 //
-// Measured metric: per-event latency from enqueued_at → leaderboard update.
+// Measured metric: scheduling drift = dequeue → leaderboard update complete.
 // Criterion reports min/mean/max with confidence intervals.
 // p50/p90/p99 printed to stderr so they appear in bench output.
 //
@@ -204,7 +246,8 @@ fn run_async_simulation() -> Vec<Duration> {
             }
         });
 
-        // Consumer task: pop + process, collect per-event latency
+        // Consumer task: pop + process, collect per-event scheduling drift
+        // (dequeue → leaderboard update complete, i.e. the Component C metric)
         let ch_cons = Arc::clone(&channel);
         let lb_cons = Arc::clone(&leaderboard);
         let consumer = tokio::spawn(async move {
@@ -213,9 +256,9 @@ fn run_async_simulation() -> Vec<Duration> {
             loop {
                 let ev = ch_cons.lock().await.pop();
                 if let Some(e) = ev {
-                    let t0 = e.enqueued_at;
+                    let dequeue_time = Instant::now();  // scheduling drift starts at dequeue
                     lb_cons.lock().await.update(&e.domain);
-                    latencies.push(t0.elapsed());
+                    latencies.push(dequeue_time.elapsed());
                     processed += 1;
                     if processed >= N_EVENTS { break; }
                 } else {
@@ -247,7 +290,7 @@ fn run_threaded_simulation() -> Vec<Duration> {
         }
     });
 
-    // Consumer thread
+    // Consumer thread: measures scheduling drift (dequeue → leaderboard update)
     let ch_cons = Arc::clone(&channel);
     let lb_cons = Arc::clone(&leaderboard);
     let consumer = thread::spawn(move || {
@@ -256,9 +299,9 @@ fn run_threaded_simulation() -> Vec<Duration> {
         loop {
             let ev = ch_cons.lock().unwrap().pop();
             if let Some(e) = ev {
-                let t0 = e.enqueued_at;
+                let dequeue_time = Instant::now();  // scheduling drift starts at dequeue
                 lb_cons.lock().unwrap().update(&e.domain);
-                latencies.push(t0.elapsed());
+                latencies.push(dequeue_time.elapsed());
                 processed += 1;
                 if processed >= N_EVENTS { break; }
             } else {
@@ -283,7 +326,7 @@ fn bench_pipeline_comparison(c: &mut Criterion) {
         let threaded_lats = run_threaded_simulation();
 
         if !async_lats.is_empty() && !threaded_lats.is_empty() {
-            eprintln!("\n========== D2: Pipeline Comparison — Latency Percentiles ==========");
+            eprintln!("\n===== D2: Pipeline Comparison — Scheduling Drift Percentiles =====");
             eprintln!(
                 "  {:12}  p50={:>8.2}µs  p90={:>8.2}µs  p99={:>8.2}µs",
                 "ASYNC",

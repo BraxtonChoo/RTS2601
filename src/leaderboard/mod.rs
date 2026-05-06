@@ -1,5 +1,9 @@
 // Component D: Leaderboard with three concurrent sync primitives
 // All three are updated on every event so timings are directly comparable.
+//
+// Component C extension: LeaderboardManager tracks the last editor type per domain.
+// last_was_human(domain) lets the processor loop reject bot edits that would
+// overwrite a human's most recent update to that domain.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -44,6 +48,11 @@ pub struct LeaderboardManager {
     mutex_times:  Vec<u64>,
     rwlock_times: Vec<u64>,
     atomic_times: Vec<u64>,
+
+    // Component C: track the last editor type per domain.
+    // true  = last edit was by a bot
+    // false = last edit was by a human (bot overwrites will be blocked)
+    last_editor_bot: HashMap<String, bool>,
 }
 
 impl LeaderboardManager {
@@ -56,14 +65,22 @@ impl LeaderboardManager {
             atomic_fr:   Arc::new(AtomicU64::new(0)),
             atomic_es:   Arc::new(AtomicU64::new(0)),
             atomic_ja:   Arc::new(AtomicU64::new(0)),
-            mutex_times:  Vec::new(),
-            rwlock_times: Vec::new(),
-            atomic_times: Vec::new(),
+            mutex_times:     Vec::new(),
+            rwlock_times:    Vec::new(),
+            atomic_times:    Vec::new(),
+            last_editor_bot: HashMap::new(),
         }
     }
 
-    // Returns (mutex_ns, rwlock_ns, atomic_ns)
-    pub fn update_all(&mut self, domain: &str) -> (u64, u64, u64) {
+    // Component C: returns true when the most recent edit to `domain` was by a human.
+    // Called under the LeaderboardManager lock so the check + update are atomic.
+    pub fn last_was_human(&self, domain: &str) -> bool {
+        self.last_editor_bot.get(domain).map(|&is_bot| !is_bot).unwrap_or(false)
+    }
+
+    // Returns (mutex_ns, rwlock_ns, atomic_ns).
+    // is_bot: whether the editor is a bot — recorded so last_was_human() works.
+    pub fn update_all(&mut self, domain: &str, is_bot: bool) -> (u64, u64, u64) {
         let t = Instant::now();
         { self.mutex_lb.lock().unwrap().update(domain); }
         let mutex_ns = t.elapsed().as_nanos() as u64;
@@ -92,7 +109,10 @@ impl LeaderboardManager {
         if self.rwlock_times.len() > 1000 { self.rwlock_times.remove(0); }
         if self.atomic_times.len() > 1000 { self.atomic_times.remove(0); }
 
-        tracing::debug!(mutex_ns, rwlock_ns, atomic_ns, domain, "Component D: Sync timings");
+        // Component C: record who last edited this domain
+        self.last_editor_bot.insert(domain.to_string(), is_bot);
+
+        tracing::debug!(mutex_ns, rwlock_ns, atomic_ns, domain, is_bot, "Component D: Sync timings");
         (mutex_ns, rwlock_ns, atomic_ns)
     }
 

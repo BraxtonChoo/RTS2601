@@ -99,31 +99,33 @@ fn print_summary(
     println!("\n╔══════════════════════════════════════════════╗");
     println!(  "║       RTS2601 — SESSION SUMMARY              ║");
     println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  Pipeline:  {:5}                            ║", state.pipeline_mode);
-    println!(  "║  Runtime:   {:02}:{:02}:{:02}                          ║", h, m, sec);
-    println!(  "║  Total events:   {:>8}                    ║", s.events_processed);
-    println!(  "║  Human edits:    {:>8}  ({:.1}%)           ║", s.human_events, h_pct);
-    println!(  "║  Bot edits:      {:>8}  ({:.1}%)           ║", s.bot_events,   b_pct);
+    println!(  "║  Pipeline:  {:5}                             ║", state.pipeline_mode);
+    println!(  "║  Runtime:   {:02}:{:02}:{:02}                ║", h, m, sec);
+    println!(  "║  Total events:   {:>8}                       ║", s.events_processed);
+    println!(  "║  Human edits:    {:>8}  ({:.1}%)             ║", s.human_events, h_pct);
+    println!(  "║  Bot edits:      {:>8}  ({:.1}%)             ║", s.bot_events,   b_pct);
     println!(  "╠══════════════════════════════════════════════╣");
     println!(  "║  COMPONENT A — CHANNEL                       ║");
-    println!(  "║  OverflowEvents:  {:>6}                    ║", s.overflow_events);
-    println!(  "║  Bot evictions:   {:>6}                    ║", s.bot_evictions);
-    println!(  "║  Bot drops:       {:>6}                    ║", s.bot_drops);
-    println!(  "║  Human drops:     {:>6}                    ║", s.human_drops);
+    println!(  "║  OverflowEvents:  {:>6}                      ║", s.overflow_events);
+    println!(  "║  Bot evictions:   {:>6}                      ║", s.bot_evictions);
+    println!(  "║  Bot drops:       {:>6}                      ║", s.bot_drops);
+    println!(  "║  Human drops:     {:>6}                      ║", s.human_drops);
     println!(  "╠══════════════════════════════════════════════╣");
     println!(  "║  COMPONENT C — SCHEDULING DRIFT              ║");
-    println!(  "║  Human  p50: {:6.2}ms  p90: {:6.2}ms        ║", h50/1000.0, h90/1000.0);
-    println!(  "║           p99: {:6.2}ms  misses: {:>4}      ║", h99/1000.0, h_miss);
-    println!(  "║  Bot    p50: {:6.2}ms  p90: {:6.2}ms        ║", b50/1000.0, b90/1000.0);
-    println!(  "║           p99: {:6.2}ms  misses: {:>4}      ║", b99/1000.0, b_miss);
+    println!(  "║  (dequeue → task complete vs 2ms deadline)   ║");
+    println!(  "║  Human  p50: {:6.3}ms  p90: {:6.3}ms        ║", h50/1000.0, h90/1000.0);
+    println!(  "║         p99: {:6.3}ms  misses: {:>4}        ║", h99/1000.0, h_miss);
+    println!(  "║  Bot    p50: {:6.3}ms  p90: {:6.3}ms        ║", b50/1000.0, b90/1000.0);
+    println!(  "║         p99: {:6.3}ms  misses: {:>4}        ║", b99/1000.0, b_miss);
+    println!(  "║  C-Blocked: {:>6} (bot→human protected)    ║", s.comp_c_rejections);
     println!(  "╠══════════════════════════════════════════════╣");
     println!(  "║  COMPONENT D — SYNC BENCHMARK (session avg)  ║");
-    println!(  "║  Mutex:   {:>8.0} ns                       ║", lb_avg_mutex);
-    println!(  "║  RwLock:  {:>8.0} ns                       ║", lb_avg_rwlock);
-    println!(  "║  Atomic:  {:>8.0} ns                       ║", lb_avg_atomic);
+    println!(  "║  Mutex:   {:>8.0} ns                         ║", lb_avg_mutex);
+    println!(  "║  RwLock:  {:>8.0} ns                         ║", lb_avg_rwlock);
+    println!(  "║  Atomic:  {:>8.0} ns                         ║", lb_avg_atomic);
     println!(  "║  Top-3 domains:                              ║");
     for (i, (domain, count)) in top3.iter().enumerate() {
-        println!("║    {}. {:20}  {:>6}           ║", i+1, domain, count);
+        println!("║    {}. {:20}  {:>6}                          ║", i+1, domain, count);
     }
     println!(  "╠══════════════════════════════════════════════╣");
     println!(  "║  COMPONENT E — FAULT TOLERANCE               ║");
@@ -229,16 +231,27 @@ async fn main() {
         };
 
         if let Some(event) = event {
+            // Component B/C: timing starts the moment the packet leaves the channel.
+            // This is the reference point for scheduling drift (dequeue → task complete).
+            let process_start = Instant::now();
+
+            // queue_wait_ms: how long the packet sat inside PriorityChannel before we
+            // picked it up.  Logged as qwait= for secondary analysis; NOT used for the
+            // 2ms deadline comparison — only scheduling drift (below) is.
+            let queue_wait_ms = event.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+
             let degraded = state.degraded_mode.load(Ordering::Relaxed);
 
             if degraded && event.is_bot {
-                let drift_ms = event.enqueued_at.elapsed().as_micros() as f64 / 1000.0;
+                // Degraded mode: immediately discard bots without touching the leaderboard.
+                let process_us = process_start.elapsed().as_micros() as f64;
+                drift_tracker.record(process_us, true);
                 if let Ok(mut s) = state.stats.lock() {
                     s.bots_discarded_degraded += 1;
                 }
                 tracing::warn!(
-                    "{:<5} DISCARD  bot  {}   {}  drift={:.2}ms",
-                    event.seq, event.user, event.domain, drift_ms
+                    "{:<5} DISCARD  bot  {}   {}  qwait={:.2}ms  sched_drift={:.3}ms",
+                    event.seq, event.user, event.domain, queue_wait_ms, process_us / 1000.0
                 );
                 continue;
             }
@@ -249,37 +262,50 @@ async fn main() {
                 }
             }
 
-            // Component C: measure queue-wait drift
-            let drift_us = drift_tracker.record(event.enqueued_at, event.is_bot);
-
-            // Component B/C: 2ms end-to-end deadline
-            let process_start = Instant::now();
-
-            // Component D: update all three sync primitives
-            let (mutex_ns, rwlock_ns, atomic_ns) = {
+            // Component C (priority-after-dequeue): a bot must NOT overwrite a domain
+            // whose most recent edit was made by a human.  The check and the update both
+            // happen under the same leaderboard lock so no race is possible.
+            let (mutex_ns, rwlock_ns, atomic_ns, comp_c_blocked) = {
                 let mut lb = leaderboard.lock().unwrap();
-                lb.update_all(&event.domain)
+                if event.is_bot && lb.last_was_human(&event.domain) {
+                    // Human edit is protected — reject this bot without updating counts
+                    (0u64, 0u64, 0u64, true)
+                } else {
+                    // Component D: update all three sync primitives and record last editor
+                    let (m, r, a) = lb.update_all(&event.domain, event.is_bot);
+                    (m, r, a, false)
+                }
             };
 
-            let process_ms      = process_start.elapsed().as_secs_f64() * 1000.0;
-            let deadline_missed = process_ms > 2.0;
+            // Scheduling drift: actual = dequeue → task complete, expected = 2ms
+            let process_us      = process_start.elapsed().as_micros() as f64;
+            let process_ms      = process_us / 1000.0;
+            let deadline_missed = !comp_c_blocked && process_ms > 2.0;
             let kind            = if event.is_bot { "bot  " } else { "human" };
 
-            if deadline_missed {
+            // Record scheduling drift for percentile tracking
+            drift_tracker.record(process_us, event.is_bot);
+
+            if comp_c_blocked {
                 tracing::warn!(
-                    "{:<5} MISS     {}  {}   {}  drift={:.2}ms  proc={:.2}ms  mutex={}ns  rwlock={}ns  atomic={}ns",
+                    "{:<5} C-BLOCK  bot  {}   {}  qwait={:.2}ms  sched_drift={:.3}ms  [human-edit protected]",
+                    event.seq, event.user, event.domain, queue_wait_ms, process_ms
+                );
+            } else if deadline_missed {
+                tracing::warn!(
+                    "{:<5} MISS     {}  {}   {}  qwait={:.2}ms  sched_drift={:.2}ms  mutex={}ns  rwlock={}ns  atomic={}ns",
                     event.seq, kind, event.user, event.domain,
-                    drift_us / 1000.0, process_ms, mutex_ns, rwlock_ns, atomic_ns
+                    queue_wait_ms, process_ms, mutex_ns, rwlock_ns, atomic_ns
                 );
             } else {
                 tracing::info!(
-                    "{:<5} {}  {}   {}  drift={:.2}ms  proc={:.2}ms",
+                    "{:<5} {}  {}   {}  qwait={:.2}ms  sched_drift={:.3}ms",
                     event.seq, kind, event.user, event.domain,
-                    drift_us / 1000.0, process_ms
+                    queue_wait_ms, process_ms
                 );
             }
 
-            // Component E: feed jitter monitor
+            // Component E: feed jitter monitor with actual processing time
             jitter_monitor.record(process_ms, &state);
 
             events_this_second += 1;
@@ -287,10 +313,14 @@ async fn main() {
             if let Ok(mut s) = state.stats.lock() {
                 s.events_processed += 1;
                 if event.is_bot { s.bot_events += 1; } else { s.human_events += 1; }
-                if deadline_missed { s.deadline_misses += 1; }
-                s.avg_mutex_ns  = leaderboard.lock().unwrap().avg_mutex_ns();
-                s.avg_rwlock_ns = leaderboard.lock().unwrap().avg_rwlock_ns();
-                s.avg_atomic_ns = leaderboard.lock().unwrap().avg_atomic_ns();
+                if deadline_missed   { s.deadline_misses   += 1; }
+                if comp_c_blocked    { s.comp_c_rejections += 1; }
+                if !comp_c_blocked {
+                    // Only refresh sync benchmark averages when a real update happened
+                    s.avg_mutex_ns  = leaderboard.lock().unwrap().avg_mutex_ns();
+                    s.avg_rwlock_ns = leaderboard.lock().unwrap().avg_rwlock_ns();
+                    s.avg_atomic_ns = leaderboard.lock().unwrap().avg_atomic_ns();
+                }
 
                 let elapsed = state.start_time.elapsed();
                 let ts = format!(
@@ -299,7 +329,13 @@ async fn main() {
                     (elapsed.as_secs() % 3600) / 60,
                     elapsed.as_secs() % 60
                 );
-                let status = if deadline_missed { EventStatus::DeadlineMissed } else { EventStatus::Processed };
+                let status = if comp_c_blocked {
+                    EventStatus::BotEvicted   // reuse tag for feed display
+                } else if deadline_missed {
+                    EventStatus::DeadlineMissed
+                } else {
+                    EventStatus::Processed
+                };
                 s.recent_events.push_back(RecentEvent {
                     timestamp: ts,
                     user:      event.user.clone(),
@@ -312,7 +348,8 @@ async fn main() {
 
             tracing::debug!(
                 pipeline = %pipeline_mode, user = %event.user, domain = %event.domain,
-                is_bot = event.is_bot, process_ms, mutex_ns, rwlock_ns, atomic_ns,
+                is_bot = event.is_bot, queue_wait_ms, process_ms,
+                comp_c_blocked, mutex_ns, rwlock_ns, atomic_ns,
                 deadline_ok = !deadline_missed, "processor event complete"
             );
 
