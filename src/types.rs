@@ -35,9 +35,12 @@ pub struct PrioritisedEvent {
     pub user:        String,
     pub is_bot:      bool,
     pub domain:      String,
-    #[allow(dead_code)]
-    pub title:       String,
+    pub title:       String,   // article name — shown in ALLOWED / BLOCKED logs as page=
     pub enqueued_at: Instant,
+    // Log-only fields — populated by parse_event, consumed by schedule_event for structured logs
+    pub raw_len:     usize,   // raw JSON bytes  → INGESTED  raw_bytes=
+    pub parse_us:    u64,     // parse duration  → PARSED    parse_us=
+    pub allocs:      u64,     // hot-path allocs → PARSED    allocs=
 }
 
 // ---------------------------------------------------------------------------
@@ -46,9 +49,9 @@ pub struct PrioritisedEvent {
 #[derive(Debug, PartialEq)]
 pub enum PushResult {
     Accepted,
-    DroppedIncoming,       // bot rejected — channel full
-    BotEvicted(String),    // evicted bot's username
-    DroppedOldest(String), // last resort: dropped human's username
+    DroppedIncoming,                   // bot rejected — channel full
+    BotEvicted(u64, String),           // (displaced_seq, displaced_user)
+    DroppedOldest(u64, String),        // (dropped_seq, dropped_user)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,19 +120,23 @@ pub enum EventStatus {
 // SharedState — one struct bundling all Arc<> pointers, cheaply cloned
 // ---------------------------------------------------------------------------
 pub struct SharedState {
-    pub stats:         Arc<Mutex<SystemStats>>,
-    pub degraded_mode: Arc<AtomicBool>,
-    pub pipeline_mode: PipelineMode,
-    pub start_time:    Instant,
+    pub stats:          Arc<Mutex<SystemStats>>,
+    pub degraded_mode:  Arc<AtomicBool>,
+    pub pipeline_mode:  PipelineMode,
+    pub start_time:     Instant,
+    /// Stamped by the ingestion pipeline on every SSE heartbeat.
+    /// The dashboard derives connection status and watchdog countdown from this.
+    pub last_heartbeat: Arc<Mutex<Instant>>,
 }
 
 impl SharedState {
     pub fn new(pipeline_mode: PipelineMode) -> Self {
         Self {
-            stats:         Arc::new(Mutex::new(SystemStats::default())),
-            degraded_mode: Arc::new(AtomicBool::new(false)),
+            stats:          Arc::new(Mutex::new(SystemStats::default())),
+            degraded_mode:  Arc::new(AtomicBool::new(false)),
             pipeline_mode,
-            start_time:    Instant::now(),
+            start_time:     Instant::now(),
+            last_heartbeat: Arc::new(Mutex::new(Instant::now())),
         }
     }
 }

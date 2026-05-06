@@ -31,19 +31,19 @@ pub fn start_watchdog(
     state:        Arc<SharedState>,
 ) {
     thread::spawn(move || {
-        tracing::info!("[WATCHDOG] Started  timeout=10s");
+        tracing::info!(actor = "SYSTEM", evt = "WATCHDOG_START", timeout = "10s");
         loop {
             match heartbeat_rx.recv_timeout(WATCHDOG_TIMEOUT) {
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
-                    tracing::warn!("[WATCHDOG] No heartbeat for 10s — triggering reconnect");
+                    tracing::warn!(actor = "SYSTEM", evt = "WATCHDOG_TIMEOUT", reason = "no_heartbeat_10s");
                     if let Ok(mut s) = state.stats.lock() {
                         s.reconnect_count += 1;
                     }
                     let _ = reconnect_tx.try_send(());
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    tracing::info!("[WATCHDOG] Shutting down");
+                    tracing::info!(actor = "SYSTEM", evt = "WATCHDOG_STOP");
                     break;
                 }
             }
@@ -100,8 +100,10 @@ impl JitterMonitor {
             self.degraded.store(true, Ordering::Relaxed);
             self.degraded_start = Some(Instant::now());
             tracing::warn!(
-                "[DEGRADED] Entering  jitter_stddev={:.2}ms  threshold={:.1}ms  bots_will_be_discarded=true",
-                jitter, self.threshold_ms
+                actor = "SYSTEM", evt = "DEGRADED_ON",
+                jitter_stddev = format_args!("{:.2}ms", jitter),
+                threshold = format_args!("{:.1}ms", self.threshold_ms),
+                bots_discarded = true
             );
             if let Ok(mut s) = state.stats.lock() {
                 s.degraded_mode            = true;
@@ -122,8 +124,11 @@ impl JitterMonitor {
                 };
 
                 tracing::info!(
-                    "[DEGRADED] Exiting  duration={:.1}s  bots_discarded={}  humans_unaffected={}  jitter_now={:.2}ms",
-                    dur_ms as f64 / 1000.0, bots_disc, hum_proc, jitter
+                    actor = "SYSTEM", evt = "DEGRADED_OFF",
+                    duration = format_args!("{:.1}s", dur_ms as f64 / 1000.0),
+                    bots_discarded = bots_disc,
+                    humans_unaffected = hum_proc,
+                    jitter_now = format_args!("{:.2}ms", jitter)
                 );
             }
             if let Ok(mut s) = state.stats.lock() {

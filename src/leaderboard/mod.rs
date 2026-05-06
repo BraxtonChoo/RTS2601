@@ -49,10 +49,11 @@ pub struct LeaderboardManager {
     rwlock_times: Vec<u64>,
     atomic_times: Vec<u64>,
 
-    // Component C: track the last editor type per domain.
-    // true  = last edit was by a bot
-    // false = last edit was by a human (bot overwrites will be blocked)
-    last_editor_bot: HashMap<String, bool>,
+    // Component C: track the last editor per domain.
+    // last_editor_bot:  true = bot, false = human
+    // last_editor_user: username of the last editor (for ALLOWED / BLOCKED logs)
+    last_editor_bot:  HashMap<String, bool>,
+    last_editor_user: HashMap<String, String>,
 }
 
 impl LeaderboardManager {
@@ -65,10 +66,11 @@ impl LeaderboardManager {
             atomic_fr:   Arc::new(AtomicU64::new(0)),
             atomic_es:   Arc::new(AtomicU64::new(0)),
             atomic_ja:   Arc::new(AtomicU64::new(0)),
-            mutex_times:     Vec::new(),
-            rwlock_times:    Vec::new(),
-            atomic_times:    Vec::new(),
-            last_editor_bot: HashMap::new(),
+            mutex_times:      Vec::new(),
+            rwlock_times:     Vec::new(),
+            atomic_times:     Vec::new(),
+            last_editor_bot:  HashMap::new(),
+            last_editor_user: HashMap::new(),
         }
     }
 
@@ -78,9 +80,23 @@ impl LeaderboardManager {
         self.last_editor_bot.get(domain).map(|&is_bot| !is_bot).unwrap_or(false)
     }
 
+    // Returns "NONE", "HUMAN(username)", or "BOT(username)" for ALLOWED/BLOCKED logs.
+    pub fn last_edit_info(&self, domain: &str) -> String {
+        match self.last_editor_bot.get(domain) {
+            None        => "NONE".to_string(),
+            Some(true)  => format!("BOT({})",   self.last_editor_user.get(domain).map(|s| s.as_str()).unwrap_or("-")),
+            Some(false) => format!("HUMAN({})", self.last_editor_user.get(domain).map(|s| s.as_str()).unwrap_or("-")),
+        }
+    }
+
+    // Returns the username of the last editor for a domain ("-" if unknown).
+    pub fn last_editor_name(&self, domain: &str) -> &str {
+        self.last_editor_user.get(domain).map(|s| s.as_str()).unwrap_or("-")
+    }
+
     // Returns (mutex_ns, rwlock_ns, atomic_ns).
-    // is_bot: whether the editor is a bot — recorded so last_was_human() works.
-    pub fn update_all(&mut self, domain: &str, is_bot: bool) -> (u64, u64, u64) {
+    // is_bot / user: recorded so last_was_human() / last_edit_info() work.
+    pub fn update_all(&mut self, domain: &str, is_bot: bool, user: &str) -> (u64, u64, u64) {
         let t = Instant::now();
         { self.mutex_lb.lock().unwrap().update(domain); }
         let mutex_ns = t.elapsed().as_nanos() as u64;
@@ -109,8 +125,9 @@ impl LeaderboardManager {
         if self.rwlock_times.len() > 1000 { self.rwlock_times.remove(0); }
         if self.atomic_times.len() > 1000 { self.atomic_times.remove(0); }
 
-        // Component C: record who last edited this domain
+        // Component C: record last editor type and username for this domain
         self.last_editor_bot.insert(domain.to_string(), is_bot);
+        self.last_editor_user.insert(domain.to_string(), user.to_string());
 
         tracing::debug!(mutex_ns, rwlock_ns, atomic_ns, domain, is_bot, "Component D: Sync timings");
         (mutex_ns, rwlock_ns, atomic_ns)

@@ -40,6 +40,10 @@ pub fn run_dashboard(
         let top3     = leaderboard.lock().unwrap().top3();
         let runtime  = state.start_time.elapsed().as_secs();
         let pipeline = state.pipeline_mode.to_string();
+        // Seconds since last SSE heartbeat — drives connection status + countdown
+        let since_hb: f64 = state.last_heartbeat.lock()
+            .map(|hb| hb.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
 
         terminal.draw(|f| {
             let size = f.size();
@@ -49,7 +53,7 @@ pub fn run_dashboard(
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Length(9),
-                    Constraint::Length(7),
+                    Constraint::Length(8),
                     Constraint::Min(0),
                 ])
                 .split(size);
@@ -185,11 +189,36 @@ pub fn run_dashboard(
                 row2[1],
             );
 
-            let wd_color  = if stats.degraded_mode { Color::Red } else { Color::Green };
-            let wd_status = if stats.degraded_mode { "⚠ DEGRADED" } else { "● CONNECTED" };
+            // Connection status derived from heartbeat age — independent of degraded mode
+            let (wd_color, wd_status, wd_detail) = if stats.degraded_mode {
+                (
+                    Color::Red,
+                    "⚠ DEGRADED".to_string(),
+                    format!(" No hb: {:.0}s ago", since_hb),
+                )
+            } else if since_hb < 10.0 {
+                // Connected — show countdown to next watchdog check
+                let timeout_in = (10.0 - since_hb).ceil() as u64;
+                (
+                    Color::Green,
+                    "● CONNECTED".to_string(),
+                    format!(" Timeout in: {}s", timeout_in),
+                )
+            } else {
+                // Heartbeat missed — watchdog will fire / has fired
+                (
+                    Color::Red,
+                    "✗ DISCONNECTED".to_string(),
+                    format!(" Reconnecting... ({:.0}s)", since_hb),
+                )
+            };
             let watchdog_text = vec![
                 Line::from(Span::styled(
                     format!(" Status: {wd_status}"),
+                    Style::default().fg(wd_color),
+                )),
+                Line::from(Span::styled(
+                    wd_detail,
                     Style::default().fg(wd_color),
                 )),
                 Line::from(format!(" Reconnects: {}", stats.reconnect_count)),

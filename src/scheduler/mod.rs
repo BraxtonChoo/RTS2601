@@ -71,9 +71,15 @@ impl DriftTracker {
         let b_miss = self.bot_samples.iter().filter(|&&d| d > 2000.0).count();
 
         tracing::info!(
-            "[DRIFT final] human p50={:.2}ms p90={:.2}ms p99={:.2}ms misses={}  |  bot p50={:.2}ms p90={:.2}ms p99={:.2}ms misses={}",
-            h50/1000.0, h90/1000.0, h99/1000.0, h_miss,
-            b50/1000.0, b90/1000.0, b99/1000.0, b_miss
+            actor = "SYSTEM", evt = "DRIFT_FINAL",
+            human_p50 = format_args!("{:.3}ms", h50/1000.0),
+            human_p90 = format_args!("{:.3}ms", h90/1000.0),
+            human_p99 = format_args!("{:.3}ms", h99/1000.0),
+            human_misses = h_miss,
+            bot_p50 = format_args!("{:.3}ms", b50/1000.0),
+            bot_p90 = format_args!("{:.3}ms", b90/1000.0),
+            bot_p99 = format_args!("{:.3}ms", b99/1000.0),
+            bot_misses = b_miss,
         );
     }
 
@@ -149,9 +155,28 @@ pub fn schedule_event(
 ) {
     let seq      = EVENT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     event.seq    = seq;
+
+    // Capture all per-event fields before push() moves the value
     let user     = event.user.clone();
     let domain   = event.domain.clone();
-    let _is_bot  = event.is_bot;
+    let is_bot   = event.is_bot;
+    let raw_len  = event.raw_len;
+    let parse_us = event.parse_us;
+    let allocs   = event.allocs;
+    let kind     = if is_bot { "BOT" } else { "HUMAN" };
+
+    // Component B — raw bytes received from SSE stream
+    tracing::info!(
+        actor = %user, kind, domain = %domain,
+        evt = "INGESTED", seq, raw_bytes = raw_len
+    );
+
+    // Component B — zero-copy parse result
+    tracing::info!(
+        actor = %user, kind, domain = %domain,
+        evt = "PARSED", seq, parse_us, allocs
+    );
+
     let (result, buf_fill, buf_cap) = {
         let mut ch = channel.lock().unwrap();
         let r    = ch.push(event);
@@ -161,23 +186,39 @@ pub fn schedule_event(
     };
 
     match &result {
-        PushResult::Accepted => {}  // logged at process time as a single line
-        PushResult::BotEvicted(displaced) => {
+        PushResult::Accepted => {
+            tracing::info!(
+                actor = %user, kind, domain = %domain,
+                evt = "ENQUEUED", seq,
+                buf = format_args!("{}/{}", buf_fill, buf_cap)
+            );
+        }
+        PushResult::BotEvicted(evicted_seq, evicted_user) => {
+            // Incoming human admitted; oldest bot displaced
             tracing::warn!(
-                "{:<5} PREEMPT  {} evicted → {} admitted   {}  buf={}/{}",
-                seq, displaced, user, domain, buf_fill, buf_cap
+                actor = %user, kind = "HUMAN", domain = %domain,
+                evt = "EVICTED", seq,
+                evicted_seq = evicted_seq, evicted_user = %evicted_user,
+                buf = format_args!("{}/{}", buf_fill, buf_cap)
             );
         }
         PushResult::DroppedIncoming => {
+            // Incoming bot dropped — channel full
             tracing::warn!(
-                "{:<5} DROP     bot  {}   {}  buf={}/{}",
-                seq, user, domain, buf_fill, buf_cap
+                actor = %user, kind = "BOT", domain = %domain,
+                evt = "DROPPED", seq,
+                reason = "bot_overflow",
+                buf = format_args!("{}/{}", buf_fill, buf_cap)
             );
         }
-        PushResult::DroppedOldest(dropped) => {
+        PushResult::DroppedOldest(dropped_seq, dropped_user) => {
+            // All-human queue — oldest human displaced for incoming human
             tracing::warn!(
-                "{:<5} DROP     human  {}   {}  buf={}  all-human-queue",
-                seq, dropped, domain, buf_fill
+                actor = %user, kind = "HUMAN", domain = %domain,
+                evt = "DROPPED", seq,
+                reason = "queue_full",
+                dropped_seq = dropped_seq, dropped_user = %dropped_user,
+                buf = format_args!("{}/{}", buf_fill, buf_cap)
             );
         }
     }
@@ -190,12 +231,12 @@ pub fn schedule_event(
                 s.overflow_events += 1;
                 Some((user.clone(), domain.clone(), true, EventStatus::BotDropped))
             }
-            PushResult::BotEvicted(_) => {
+            PushResult::BotEvicted(_, _) => {
                 s.bot_evictions  += 1;
                 s.overflow_events += 1;
                 Some((user.clone(), domain.clone(), true, EventStatus::BotEvicted))
             }
-            PushResult::DroppedOldest(_) => {
+            PushResult::DroppedOldest(_, _) => {
                 s.human_drops    += 1;
                 s.overflow_events += 1;
                 None

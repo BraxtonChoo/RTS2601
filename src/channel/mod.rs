@@ -50,15 +50,15 @@ impl PriorityChannel {
         match bot_pos {
             Some(pos) => {
                 let evicted = self.buffer.remove(pos).unwrap();
-                let evicted_user = evicted.user.clone();
+                let (evicted_seq, evicted_user) = (evicted.seq, evicted.user.clone());
                 self.buffer.push_back(event);
-                PushResult::BotEvicted(evicted_user)
+                PushResult::BotEvicted(evicted_seq, evicted_user)
             }
             None => {
                 let dropped = self.buffer.pop_front().unwrap();
-                let dropped_user = dropped.user.clone();
+                let (dropped_seq, dropped_user) = (dropped.seq, dropped.user.clone());
                 self.buffer.push_back(event);
-                PushResult::DroppedOldest(dropped_user)
+                PushResult::DroppedOldest(dropped_seq, dropped_user)
             }
         }
     }
@@ -85,38 +85,40 @@ impl PriorityChannel {
         self.buffer.is_empty()
     }
 
-    // Emit [BUFFER] warning when fill crosses 50 % or 80 % upward
+    // Emit structured BUFFER_80PCT / BUFFER_50PCT when fill crosses thresholds upward
     fn check_pressure(&mut self) {
-        let pct = self.buffer.len() * 100 / self.capacity;
+        let fill = self.buffer.len();
+        let pct  = fill * 100 / self.capacity;
         if pct >= 80 && self.pressure_level < 2 {
             self.pressure_level = 2;
-            let h = self.buffer.iter().filter(|e| !e.is_bot).count();
-            let b = self.buffer.len() - h;
+            let human_in_buf = self.buffer.iter().filter(|e| !e.is_bot).count();
+            let bot_in_buf   = fill - human_in_buf;
+            let buf = format!("{}/{}", fill, self.capacity);
             tracing::warn!(
-                "[BUFFER] 80% full  ({}/{})  human={}  bot={}  overflow risk",
-                self.buffer.len(), self.capacity, h, b
+                actor = "SYSTEM", evt = "BUFFER_80PCT",
+                fill = %buf, human_in_buf, bot_in_buf
             );
         } else if pct >= 50 && self.pressure_level < 1 {
             self.pressure_level = 1;
-            let h = self.buffer.iter().filter(|e| !e.is_bot).count();
-            let b = self.buffer.len() - h;
+            let human_in_buf = self.buffer.iter().filter(|e| !e.is_bot).count();
+            let bot_in_buf   = fill - human_in_buf;
+            let buf = format!("{}/{}", fill, self.capacity);
             tracing::info!(
-                "[BUFFER] 50% full  ({}/{})  human={}  bot={}",
-                self.buffer.len(), self.capacity, h, b
+                actor = "SYSTEM", evt = "BUFFER_50PCT",
+                fill = %buf, human_in_buf, bot_in_buf
             );
         }
     }
 
-    // Emit [BUFFER] info when fill drops back below 40 % after pressure
+    // Emit BUFFER_EASED when fill drops back below 40 % after pressure
     fn check_ease(&mut self) {
         if self.pressure_level > 0 {
-            let pct = self.buffer.len() * 100 / self.capacity;
+            let fill = self.buffer.len();
+            let pct  = fill * 100 / self.capacity;
             if pct < 40 {
                 self.pressure_level = 0;
-                tracing::info!(
-                    "[BUFFER] Pressure eased  ({}/{})",
-                    self.buffer.len(), self.capacity
-                );
+                let buf = format!("{}/{}", fill, self.capacity);
+                tracing::info!(actor = "SYSTEM", evt = "BUFFER_EASED", fill = %buf);
             }
         }
     }

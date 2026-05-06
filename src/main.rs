@@ -84,15 +84,15 @@ fn print_summary(
 
     // Log structured session-end line first (goes to file)
     tracing::info!(
-        "[SESSION END] runtime={:02}:{:02}:{:02}  total={}  human={}({:.1}%)  bot={}({:.1}%)  deadline_misses={}({:.1}%)  overflows={}  reconnects={}  degraded_windows={}",
-        h, m, sec,
-        s.events_processed,
-        s.human_events, h_pct,
-        s.bot_events,   b_pct,
-        s.deadline_misses, miss_rate,
-        s.overflow_events,
-        s.reconnect_count,
-        s.degraded_activations
+        actor = "SYSTEM", evt = "SESSION_END",
+        runtime = format_args!("{:02}:{:02}:{:02}", h, m, sec),
+        total = s.events_processed,
+        human = format_args!("{}({:.1}%)", s.human_events, h_pct),
+        bot = format_args!("{}({:.1}%)", s.bot_events, b_pct),
+        deadline_misses = format_args!("{}({:.1}%)", s.deadline_misses, miss_rate),
+        overflows = s.overflow_events,
+        reconnects = s.reconnect_count,
+        degraded_windows = s.degraded_activations
     );
 
     // Human-readable terminal summary
@@ -151,8 +151,9 @@ async fn main() {
     let leaderboard = Arc::new(Mutex::new(LeaderboardManager::new()));
 
     tracing::info!(
-        "[SESSION START] pipeline={}  buffer=100  drift_deadline=2ms  watchdog_timeout=10s",
-        pipeline_mode
+        actor = "SYSTEM", evt = "SESSION_START",
+        pipeline = %pipeline_mode, buffer = 100,
+        drift_deadline = "2ms", watchdog_timeout = "10s"
     );
 
     // Watchdog channels
@@ -250,8 +251,11 @@ async fn main() {
                     s.bots_discarded_degraded += 1;
                 }
                 tracing::warn!(
-                    "{:<5} DISCARD  bot  {}   {}  qwait={:.2}ms  sched_drift={:.3}ms",
-                    event.seq, event.user, event.domain, queue_wait_ms, process_us / 1000.0
+                    actor = %event.user, kind = "BOT", domain = %event.domain,
+                    evt = "DISCARDED", seq = event.seq,
+                    qwait = format_args!("{:.2}ms", queue_wait_ms),
+                    sched_drift = format_args!("{:.3}ms", process_us / 1000.0),
+                    reason = "degraded_mode"
                 );
                 continue;
             }
@@ -272,7 +276,7 @@ async fn main() {
                     (0u64, 0u64, 0u64, true)
                 } else {
                     // Component D: update all three sync primitives and record last editor
-                    let (m, r, a) = lb.update_all(&event.domain, event.is_bot);
+                    let (m, r, a) = lb.update_all(&event.domain, event.is_bot, &event.user);
                     (m, r, a, false)
                 }
             };
@@ -281,27 +285,34 @@ async fn main() {
             let process_us      = process_start.elapsed().as_micros() as f64;
             let process_ms      = process_us / 1000.0;
             let deadline_missed = !comp_c_blocked && process_ms > 2.0;
-            let kind            = if event.is_bot { "bot  " } else { "human" };
+            let kind            = if event.is_bot { "BOT" } else { "HUMAN" };
 
             // Record scheduling drift for percentile tracking
             drift_tracker.record(process_us, event.is_bot);
 
             if comp_c_blocked {
                 tracing::warn!(
-                    "{:<5} C-BLOCK  bot  {}   {}  qwait={:.2}ms  sched_drift={:.3}ms  [human-edit protected]",
-                    event.seq, event.user, event.domain, queue_wait_ms, process_ms
+                    actor = %event.user, kind = "BOT", domain = %event.domain,
+                    evt = "BLOCKED", seq = event.seq,
+                    qwait = format_args!("{:.2}ms", queue_wait_ms),
+                    sched_drift = format_args!("{:.3}ms", process_ms),
+                    reason = "human_protected"
                 );
             } else if deadline_missed {
                 tracing::warn!(
-                    "{:<5} MISS     {}  {}   {}  qwait={:.2}ms  sched_drift={:.2}ms  mutex={}ns  rwlock={}ns  atomic={}ns",
-                    event.seq, kind, event.user, event.domain,
-                    queue_wait_ms, process_ms, mutex_ns, rwlock_ns, atomic_ns
+                    actor = %event.user, kind = %kind, domain = %event.domain,
+                    evt = "DONE", seq = event.seq,
+                    qwait = format_args!("{:.2}ms", queue_wait_ms),
+                    sched_drift = format_args!("{:.3}ms", process_ms),
+                    deadline = "MISS",
+                    mutex_ns, rwlock_ns, atomic_ns
                 );
             } else {
                 tracing::info!(
-                    "{:<5} {}  {}   {}  qwait={:.2}ms  sched_drift={:.3}ms",
-                    event.seq, kind, event.user, event.domain,
-                    queue_wait_ms, process_ms
+                    actor = %event.user, kind = %kind, domain = %event.domain,
+                    evt = "DONE", seq = event.seq,
+                    qwait = format_args!("{:.2}ms", queue_wait_ms),
+                    sched_drift = format_args!("{:.3}ms", process_ms)
                 );
             }
 
@@ -371,14 +382,17 @@ async fn main() {
                     if !spike_active && baseline > 5.0 && tps > baseline * 2.5 {
                         spike_active = true;
                         tracing::warn!(
-                            "[THROUGHPUT] Spike detected  current={:.0}/s  baseline={:.0}/s  ratio={:.1}x",
-                            tps, baseline, tps / baseline
+                            actor = "SYSTEM", evt = "THROUGHPUT_SPIKE",
+                            current = format_args!("{:.0}/s", tps),
+                            baseline = format_args!("{:.0}/s", baseline),
+                            ratio = format_args!("{:.1}x", tps / baseline)
                         );
                     } else if spike_active && tps < baseline * 1.5 {
                         spike_active = false;
                         tracing::info!(
-                            "[THROUGHPUT] Normalised  current={:.0}/s  baseline={:.0}/s",
-                            tps, baseline
+                            actor = "SYSTEM", evt = "THROUGHPUT_NORMAL",
+                            current = format_args!("{:.0}/s", tps),
+                            baseline = format_args!("{:.0}/s", baseline)
                         );
                     }
                 }
@@ -413,8 +427,14 @@ async fn main() {
                 let overflow_rate = if new_processed > 0 { new_overflows as f64 / new_processed as f64 * 100.0 } else { 0.0 };
 
                 tracing::info!(
-                    "[CHECKPOINT 30s] processed={}  tps={:.1}/s  miss_rate={:.1}%  overflow_rate={:.1}%  buf={}/100  mode={}  preemptions={}  bot_rejections={}  human_drops={}",
-                    new_processed, tps, miss_rate, overflow_rate, buf, mode_str, preemptions, bot_rejections, human_drops
+                    actor = "SYSTEM", evt = "CHECKPOINT",
+                    processed = new_processed,
+                    tps = format_args!("{:.1}/s", tps),
+                    miss_rate = format_args!("{:.1}%", miss_rate),
+                    overflow_rate = format_args!("{:.1}%", overflow_rate),
+                    buf = format_args!("{}/100", buf),
+                    mode = %mode_str,
+                    preemptions, bot_rejections, human_drops
                 );
             }
         } else {

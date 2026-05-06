@@ -25,7 +25,7 @@ pub async fn run_async_pipeline(
     loop {
         attempt += 1;
         if attempt > 1 {
-            tracing::info!("[PIPELINE] Reconnecting...  attempt={}", attempt);
+            tracing::info!(actor = "SYSTEM", evt = "RECONNECTING", attempt, pipeline = "async");
         }
 
         let client = reqwest::Client::builder()
@@ -43,7 +43,7 @@ pub async fn run_async_pipeline(
         {
             Ok(r)  => r,
             Err(e) => {
-                tracing::error!("[PIPELINE] Connection failed  attempt={}  error={}", attempt, e);
+                tracing::error!(actor = "SYSTEM", evt = "CONNECT_FAIL", attempt, error = %e);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -51,12 +51,12 @@ pub async fn run_async_pipeline(
 
         let status = response.status();
         if !status.is_success() {
-            tracing::error!("[PIPELINE] HTTP {}  retrying in 5s", status);
+            tracing::error!(actor = "SYSTEM", evt = "HTTP_ERROR", status = %status);
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
 
-        tracing::info!("[PIPELINE] Connected to Wikipedia SSE stream  pipeline=async");
+        tracing::info!(actor = "SYSTEM", evt = "CONNECTED", pipeline = "async");
 
         let mut stream      = response.bytes_stream();
         let mut buf         = String::new();
@@ -65,14 +65,14 @@ pub async fn run_async_pipeline(
 
         'inner: loop {
             if reconnect_rx.try_recv().is_ok() {
-                tracing::warn!("[PIPELINE] Reconnect signal received — dropping connection");
+                tracing::warn!(actor = "SYSTEM", evt = "RECONNECT_SIGNAL", pipeline = "async");
                 break 'inner;
             }
 
             let chunk = match tokio::time::timeout(Duration::from_secs(1), stream.next()).await {
                 Ok(Some(result)) => result,
                 Ok(None) => {
-                    tracing::warn!("[PIPELINE] Stream ended unexpectedly");
+                    tracing::warn!(actor = "SYSTEM", evt = "STREAM_END", pipeline = "async");
                     break 'inner;
                 }
                 Err(_) => continue 'inner,
@@ -80,7 +80,7 @@ pub async fn run_async_pipeline(
 
             match chunk {
                 Err(e) => {
-                    tracing::error!("[PIPELINE] Stream error  error={}", e);
+                    tracing::error!(actor = "SYSTEM", evt = "STREAM_ERROR", pipeline = "async", error = %e);
                     break 'inner;
                 }
                 Ok(bytes) => {
@@ -97,28 +97,27 @@ pub async fn run_async_pipeline(
 
                         if let Some(json) = line.strip_prefix("data: ") {
                             let _ = heartbeat_tx.try_send(());
+                            if let Ok(mut hb) = state.last_heartbeat.lock() {
+                                *hb = Instant::now();
+                            }
 
                             if first_event {
                                 first_event = false;
                                 tracing::info!(
-                                    "[PIPELINE] First event received  stream_confirmed_live=true  latency={:.2}s",
-                                    connect_time.elapsed().as_secs_f64()
+                                    actor = "SYSTEM", evt = "STREAM_LIVE",
+                                    latency = format_args!("{:.2}s", connect_time.elapsed().as_secs_f64())
                                 );
                                 attempt = 0; // reset for next disconnect cycle
                             }
 
                             match parse_event(json) {
                                 Ok(event) => {
-                                    tracing::debug!(
-                                        "[event] user={}  domain={}  bot={}",
-                                        event.user, event.domain, event.is_bot
-                                    );
                                     schedule_event(event, &channel, &state);
                                 }
                                 Err(e) => {
                                     tracing::debug!(
-                                        "[PARSE] Skipped  reason=\"{}\"  raw_len={}B",
-                                        e, json.len()
+                                        actor = "SYSTEM", evt = "PARSE_SKIP",
+                                        reason = %e, raw_bytes = json.len()
                                     );
                                 }
                             }

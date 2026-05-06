@@ -26,7 +26,7 @@ pub fn run_threaded_pipeline(
         loop {
             attempt += 1;
             if attempt > 1 {
-                tracing::info!("[PIPELINE] Reconnecting...  attempt={}", attempt);
+                tracing::info!(actor = "SYSTEM", evt = "RECONNECTING", attempt, pipeline = "threaded");
             }
 
             let agent = ureq::AgentBuilder::new()
@@ -42,13 +42,13 @@ pub fn run_threaded_pipeline(
             {
                 Ok(r)  => r,
                 Err(e) => {
-                    tracing::error!("[PIPELINE] Connection failed  attempt={}  error={}", attempt, e);
+                    tracing::error!(actor = "SYSTEM", evt = "CONNECT_FAIL", attempt, error = %e);
                     thread::sleep(Duration::from_secs(5));
                     continue;
                 }
             };
 
-            tracing::info!("[PIPELINE] Connected to Wikipedia SSE stream  pipeline=threaded");
+            tracing::info!(actor = "SYSTEM", evt = "CONNECTED", pipeline = "threaded");
 
             let reader       = BufReader::new(response.into_reader());
             let connect_time = Instant::now();
@@ -56,7 +56,7 @@ pub fn run_threaded_pipeline(
 
             'inner: for line_result in reader.lines() {
                 if reconnect_rx.try_recv().is_ok() {
-                    tracing::warn!("[PIPELINE] Reconnect signal received — dropping connection");
+                    tracing::warn!(actor = "SYSTEM", evt = "RECONNECT_SIGNAL", pipeline = "threaded");
                     if let Ok(mut s) = state.stats.lock() {
                         s.reconnect_count += 1;
                     }
@@ -65,34 +65,33 @@ pub fn run_threaded_pipeline(
 
                 match line_result {
                     Err(e) => {
-                        tracing::error!("[PIPELINE] Stream error  error={}", e);
+                        tracing::error!(actor = "SYSTEM", evt = "STREAM_ERROR", pipeline = "threaded", error = %e);
                         break 'inner;
                     }
                     Ok(line) => {
                         if let Some(json) = line.trim().strip_prefix("data: ") {
                             let _ = heartbeat_tx.try_send(());
+                            if let Ok(mut hb) = state.last_heartbeat.lock() {
+                                *hb = Instant::now();
+                            }
 
                             if first_event {
                                 first_event = false;
                                 tracing::info!(
-                                    "[PIPELINE] First event received  stream_confirmed_live=true  latency={:.2}s",
-                                    connect_time.elapsed().as_secs_f64()
+                                    actor = "SYSTEM", evt = "STREAM_LIVE",
+                                    latency = format_args!("{:.2}s", connect_time.elapsed().as_secs_f64())
                                 );
                                 attempt = 0;
                             }
 
                             match parse_event(json) {
                                 Ok(event) => {
-                                    tracing::debug!(
-                                        "[event] user={}  domain={}  bot={}",
-                                        event.user, event.domain, event.is_bot
-                                    );
                                     schedule_event(event, &channel, &state);
                                 }
                                 Err(e) => {
                                     tracing::debug!(
-                                        "[PARSE] Skipped  reason=\"{}\"  raw_len={}B",
-                                        e, json.len()
+                                        actor = "SYSTEM", evt = "PARSE_SKIP",
+                                        reason = %e, raw_bytes = json.len()
                                     );
                                 }
                             }
