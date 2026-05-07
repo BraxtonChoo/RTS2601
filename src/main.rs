@@ -285,17 +285,18 @@ async fn main() {
                 }
             }
 
-            // Component C (priority-after-dequeue): a bot must NOT overwrite a domain
-            // whose most recent edit was made by a human.  The check and the update both
-            // happen under the same leaderboard lock so no race is possible.
+            // Component C (priority-after-dequeue): a bot must NOT overwrite the specific
+            // page whose most recent edit was made by a human.  Protection is page-level
+            // (keyed by title) so bots editing other pages on the same domain are unaffected.
+            // The check and the update both happen under the same leaderboard lock — atomic.
             let (mutex_ns, rwlock_ns, atomic_ns, comp_c_blocked) = {
                 let mut lb = leaderboard.lock().unwrap();
-                if event.is_bot && lb.last_was_human(&event.domain) {
-                    // Human edit is protected — reject this bot without updating counts
+                if event.is_bot && lb.last_was_human(&event.title) {
+                    // This exact page was last edited by a human — reject bot
                     (0u64, 0u64, 0u64, true)
                 } else {
                     // Component D: update all three sync primitives and record last editor
-                    let (m, r, a) = lb.update_all(&event.domain, event.is_bot, &event.user);
+                    let (m, r, a) = lb.update_all(&event.domain, event.is_bot, &event.user, &event.title);
                     (m, r, a, false)
                 }
             };

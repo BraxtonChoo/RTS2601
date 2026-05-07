@@ -74,15 +74,20 @@ impl LeaderboardManager {
         }
     }
 
-    // Component C: returns true when the most recent edit to `domain` was by a human.
+    // Component C: returns true when the most recent edit to this specific `title`
+    // (article page) was by a human.  Keyed by page title so that a human editing
+    // one article does not accidentally block bots on unrelated articles on the
+    // same domain.
     // Called under the LeaderboardManager lock so the check + update are atomic.
-    pub fn last_was_human(&self, domain: &str) -> bool {
-        self.last_editor_bot.get(domain).map(|&is_bot| !is_bot).unwrap_or(false)
+    pub fn last_was_human(&self, title: &str) -> bool {
+        self.last_editor_bot.get(title).map(|&is_bot| !is_bot).unwrap_or(false)
     }
 
     // Returns (mutex_ns, rwlock_ns, atomic_ns).
-    // is_bot / user: recorded so last_was_human() works.
-    pub fn update_all(&mut self, domain: &str, is_bot: bool, user: &str) -> (u64, u64, u64) {
+    // domain: used for leaderboard counts and atomic counter selection.
+    // title:  used as the Component C protection key (page-level, not domain-level).
+    // is_bot / user: recorded so last_was_human() works correctly per page.
+    pub fn update_all(&mut self, domain: &str, is_bot: bool, user: &str, title: &str) -> (u64, u64, u64) {
         let t = Instant::now();
         { self.mutex_lb.lock().unwrap().update(domain); }
         let mutex_ns = t.elapsed().as_nanos() as u64;
@@ -111,11 +116,12 @@ impl LeaderboardManager {
         if self.rwlock_times.len() > 1000 { self.rwlock_times.remove(0); }
         if self.atomic_times.len() > 1000 { self.atomic_times.remove(0); }
 
-        // Component C: record last editor type and username for this domain
-        self.last_editor_bot.insert(domain.to_string(), is_bot);
-        self.last_editor_user.insert(domain.to_string(), user.to_string());
+        // Component C: record last editor keyed by page title (not domain)
+        // so protection is scoped to the exact article, not the whole domain.
+        self.last_editor_bot.insert(title.to_string(), is_bot);
+        self.last_editor_user.insert(title.to_string(), user.to_string());
 
-        tracing::debug!(mutex_ns, rwlock_ns, atomic_ns, domain, is_bot, "Component D: Sync timings");
+        tracing::debug!(mutex_ns, rwlock_ns, atomic_ns, domain, title, is_bot, "Component D: Sync timings");
         (mutex_ns, rwlock_ns, atomic_ns)
     }
 
