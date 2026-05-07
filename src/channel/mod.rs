@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::config::{BUFFER_CRITICAL_PCT, BUFFER_EASE_PCT, BUFFER_WARN_PCT};
 use crate::types::{PrioritisedEvent, PushResult};
 
 pub struct PriorityChannel {
@@ -96,7 +97,7 @@ impl PriorityChannel {
     fn check_pressure(&mut self) {
         let fill = self.buffer.len();
         let pct  = fill * 100 / self.capacity;
-        if pct >= 80 && self.pressure_level < 2 {
+        if pct >= BUFFER_CRITICAL_PCT && self.pressure_level < 2 {
             self.pressure_level = 2;
             let human_in_buf = self.buffer.iter().filter(|e| !e.is_bot).count();
             let bot_in_buf   = fill - human_in_buf;
@@ -105,7 +106,7 @@ impl PriorityChannel {
                 actor = "SYSTEM", evt = "BUFFER_80PCT",
                 fill = %buf, human_in_buf, bot_in_buf
             );
-        } else if pct >= 50 && self.pressure_level < 1 {
+        } else if pct >= BUFFER_WARN_PCT && self.pressure_level < 1 {
             self.pressure_level = 1;
             let human_in_buf = self.buffer.iter().filter(|e| !e.is_bot).count();
             let bot_in_buf   = fill - human_in_buf;
@@ -122,7 +123,7 @@ impl PriorityChannel {
         if self.pressure_level > 0 {
             let fill = self.buffer.len();
             let pct  = fill * 100 / self.capacity;
-            if pct < 40 {
+            if pct < BUFFER_EASE_PCT {
                 self.pressure_level = 0;
                 let buf = format!("{}/{}", fill, self.capacity);
                 tracing::info!(actor = "SYSTEM", evt = "BUFFER_EASED", fill = %buf);

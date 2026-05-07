@@ -103,7 +103,6 @@ pub struct SystemStats {
     pub drift_history: VecDeque<u64>,
 }
 
-pub const DRIFT_HISTORY_LEN: usize = 300;
 
 #[derive(Debug, Clone)]
 pub struct RecentEvent {

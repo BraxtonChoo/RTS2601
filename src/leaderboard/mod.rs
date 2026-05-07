@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::config::LEADERBOARD_ROLLING_WINDOW;
+
 #[derive(Debug, Default)]
 pub struct Leaderboard {
     pub counts: HashMap<String, u64>,
@@ -112,9 +114,9 @@ impl LeaderboardManager {
         self.mutex_times.push(mutex_ns);
         self.rwlock_times.push(rwlock_ns);
         self.atomic_times.push(atomic_ns);
-        if self.mutex_times.len()  > 1000 { self.mutex_times.remove(0); }
-        if self.rwlock_times.len() > 1000 { self.rwlock_times.remove(0); }
-        if self.atomic_times.len() > 1000 { self.atomic_times.remove(0); }
+        if self.mutex_times.len()  > LEADERBOARD_ROLLING_WINDOW { self.mutex_times.remove(0); }
+        if self.rwlock_times.len() > LEADERBOARD_ROLLING_WINDOW { self.rwlock_times.remove(0); }
+        if self.atomic_times.len() > LEADERBOARD_ROLLING_WINDOW { self.atomic_times.remove(0); }
 
         // Component C: record last editor keyed by page title (not domain)
         // so protection is scoped to the exact article, not the whole domain.

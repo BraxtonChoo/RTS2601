@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender};
 use futures_util::StreamExt;
 
 use crate::channel::PriorityChannel;
+use crate::config::{CONNECT_FAIL_BACKOFF, CONNECT_TIMEOUT, RECONNECT_BACKOFF};
 use crate::parser::parse_event;
 use crate::scheduler::schedule_event;
 use crate::types::SharedState;
@@ -29,7 +30,7 @@ pub async fn run_async_pipeline(
         }
 
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -44,7 +45,7 @@ pub async fn run_async_pipeline(
             Ok(r)  => r,
             Err(e) => {
                 tracing::error!(actor = "SYSTEM", evt = "CONNECT_FAIL", attempt, error = %e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(CONNECT_FAIL_BACKOFF).await;
                 continue;
             }
         };
@@ -52,7 +53,7 @@ pub async fn run_async_pipeline(
         let status = response.status();
         if !status.is_success() {
             tracing::error!(actor = "SYSTEM", evt = "HTTP_ERROR", status = %status);
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(CONNECT_FAIL_BACKOFF).await;
             continue;
         }
 
@@ -127,6 +128,6 @@ pub async fn run_async_pipeline(
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(RECONNECT_BACKOFF).await;
     }
 }

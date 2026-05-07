@@ -3,11 +3,12 @@
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::channel::PriorityChannel;
+use crate::config::{CONNECT_FAIL_BACKOFF, CONNECT_TIMEOUT, RECONNECT_BACKOFF};
 use crate::parser::parse_event;
 use crate::scheduler::schedule_event;
 use crate::types::SharedState;
@@ -30,7 +31,7 @@ pub fn run_threaded_pipeline(
             }
 
             let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
+                .timeout_connect(CONNECT_TIMEOUT)
                 .build();
 
             let response = match agent
@@ -43,7 +44,7 @@ pub fn run_threaded_pipeline(
                 Ok(r)  => r,
                 Err(e) => {
                     tracing::error!(actor = "SYSTEM", evt = "CONNECT_FAIL", attempt, error = %e);
-                    thread::sleep(Duration::from_secs(5));
+                    thread::sleep(CONNECT_FAIL_BACKOFF);
                     continue;
                 }
             };
@@ -98,7 +99,7 @@ pub fn run_threaded_pipeline(
                 }
             }
 
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(RECONNECT_BACKOFF);
         }
     });
 }

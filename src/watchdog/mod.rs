@@ -12,15 +12,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
+use crate::config::{JITTER_MIN_SAMPLES, JITTER_THRESHOLD_MS, JITTER_WINDOW, WATCHDOG_TIMEOUT};
 use crate::types::SharedState;
-
-const WATCHDOG_TIMEOUT:   Duration = Duration::from_secs(10);
-const JITTER_THRESHOLD_MS: f64    = 5.0;
-const JITTER_WINDOW:       usize  = 100;
 
 // ---------------------------------------------------------------------------
 // start_watchdog
@@ -80,7 +77,7 @@ impl JitterMonitor {
             self.recent_times.pop_front();
         }
         self.recent_times.push_back(processing_time_ms);
-        if self.recent_times.len() >= 10 {
+        if self.recent_times.len() >= JITTER_MIN_SAMPLES {
             self.evaluate(state);
         }
     }

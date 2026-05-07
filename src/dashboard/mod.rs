@@ -19,8 +19,12 @@ use ratatui::{
 };
 
 use crate::CHANNEL_CAPACITY;
+use crate::config::{
+    CHART_Y_CEIL_US, CHART_Y_FLOOR_US, DASHBOARD_POLL_MS, DRIFT_DEADLINE_MS,
+    DRIFT_HISTORY_LEN, WATCHDOG_TIMEOUT,
+};
 use crate::leaderboard::LeaderboardManager;
-use crate::types::{EventStatus, SharedState, DRIFT_HISTORY_LEN};
+use crate::types::{EventStatus, SharedState};
 
 fn format_runtime(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
@@ -120,7 +124,7 @@ pub fn run_dashboard(
 
             // Scheduling drift = dequeue → task complete (Component C metric).
             // Green when p99 < 2ms (within deadline), Red when deadline is being missed.
-            let dc = if stats.drift_p99 < 2.0 { Color::Green } else { Color::Red };
+            let dc = if stats.drift_p99 < DRIFT_DEADLINE_MS { Color::Green } else { Color::Red };
             let latency_text = vec![
                 Line::from(Span::styled(
                     format!(" Drift p50: {:.3}ms", stats.drift_p50),
@@ -135,7 +139,7 @@ pub fn run_dashboard(
                     Style::default().fg(dc),
                 )),
                 Line::from(Span::styled(
-                    " Deadline:  2.000ms",
+                    format!(" Deadline:  {:.3}ms", DRIFT_DEADLINE_MS),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(format!(" Misses:   {}", stats.deadline_misses)),
@@ -199,9 +203,9 @@ pub fn run_dashboard(
                     "⚠ DEGRADED".to_string(),
                     format!(" No hb: {:.0}s ago", since_hb),
                 )
-            } else if since_hb < 10.0 {
+            } else if since_hb < WATCHDOG_TIMEOUT.as_secs_f64() {
                 // Connected — show countdown to next watchdog check
-                let timeout_in = (10.0 - since_hb).ceil() as u64;
+                let timeout_in = (WATCHDOG_TIMEOUT.as_secs_f64() - since_hb).ceil() as u64;
                 (
                     Color::Green,
                     "● CONNECTED".to_string(),
@@ -241,8 +245,8 @@ pub fn run_dashboard(
             // A yellow horizontal reference line is drawn at 2000µs (the 2ms deadline)
             // whenever it falls within the visible y-range.
             let drift_data: Vec<u64> = stats.drift_history.iter().copied().collect();
-            let max_sample  = drift_data.iter().copied().max().unwrap_or(100);
-            let display_max = max_sample.clamp(100, 10_000) as f64;
+            let max_sample  = drift_data.iter().copied().max().unwrap_or(CHART_Y_FLOOR_US);
+            let display_max = max_sample.clamp(CHART_Y_FLOOR_US, CHART_Y_CEIL_US) as f64;
             let x_bound     = DRIFT_HISTORY_LEN as f64;
             let line_color  = if stats.drift_p99 < 2.0 { Color::Green } else { Color::Red };
 
@@ -340,7 +344,7 @@ pub fn run_dashboard(
             );
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(DASHBOARD_POLL_MS))? {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q') {
                     exit_flag.store(true, Ordering::Relaxed);

@@ -1,5 +1,6 @@
 mod allocator;
 mod channel;
+mod config;
 mod dashboard;
 mod ingestion;
 mod leaderboard;
@@ -24,10 +25,14 @@ use crossbeam_channel::bounded;
 use channel::PriorityChannel;
 use leaderboard::LeaderboardManager;
 use scheduler::DriftTracker;
-use types::{EventStatus, PipelineMode, RecentEvent, SharedState, DRIFT_HISTORY_LEN};
+use config::{
+    CHANNEL_CAPACITY, CHECKPOINT_INTERVAL_SECS, DRIFT_DEADLINE_MS, DRIFT_HISTORY_LEN,
+    HEARTBEAT_CHANNEL_CAP, RECENT_EVENTS_LEN, RECONNECT_CHANNEL_CAP,
+    SPIKE_BASELINE_MIN_SAMPLES, SPIKE_BASELINE_MIN_TPS, SPIKE_RATIO, SPIKE_RECOVERY_RATIO,
+    STATS_TICK_SECS, TPS_HISTORY_LEN,
+};
+use types::{EventStatus, PipelineMode, RecentEvent, SharedState};
 use watchdog::{start_watchdog, JitterMonitor};
-
-pub const CHANNEL_CAPACITY: usize = 100;
 
 // ---------------------------------------------------------------------------
 // CLI flag parsing
@@ -171,12 +176,13 @@ async fn main() {
     tracing::info!(
         actor = "SYSTEM", evt = "SESSION_START",
         pipeline = %pipeline_mode, buffer = CHANNEL_CAPACITY,
-        drift_deadline = "2ms", watchdog_timeout = "10s"
+        drift_deadline = format_args!("{:.0}ms", DRIFT_DEADLINE_MS),
+        watchdog_timeout = format_args!("{}s", config::WATCHDOG_TIMEOUT.as_secs())
     );
 
     // Watchdog channels
-    let (heartbeat_tx, heartbeat_rx) = bounded::<()>(10);
-    let (reconnect_tx, reconnect_rx) = bounded::<()>(1);
+    let (heartbeat_tx, heartbeat_rx) = bounded::<()>(HEARTBEAT_CHANNEL_CAP);
+    let (reconnect_tx, reconnect_rx) = bounded::<()>(RECONNECT_CHANNEL_CAP);
 
     start_watchdog(heartbeat_rx, reconnect_tx, Arc::clone(&state));
 
@@ -234,7 +240,7 @@ async fn main() {
     let mut total_processed_checkpoint       = 0u64;
 
     // Throughput spike detection: keep a rolling 60-sample baseline (one per second)
-    let mut tps_history: VecDeque<f64> = VecDeque::with_capacity(60);
+    let mut tps_history: VecDeque<f64> = VecDeque::with_capacity(TPS_HISTORY_LEN);
     let mut spike_active = false;
 
     loop {
@@ -304,7 +310,7 @@ async fn main() {
             // Scheduling drift: actual = dequeue → task complete, expected = 2ms
             let process_us      = process_start.elapsed().as_micros() as f64;
             let process_ms      = process_us / 1000.0;
-            let deadline_missed = !comp_c_blocked && process_ms > 2.0;
+            let deadline_missed = !comp_c_blocked && process_ms > DRIFT_DEADLINE_MS;
             let kind            = if event.is_bot { "BOT" } else { "HUMAN" };
 
             // Record scheduling drift for percentile tracking
@@ -383,7 +389,7 @@ async fn main() {
                     is_bot:    event.is_bot,
                     status,
                 });
-                if s.recent_events.len() > 10 { s.recent_events.pop_front(); }
+                if s.recent_events.len() > RECENT_EVENTS_LEN { s.recent_events.pop_front(); }
             }
 
             tracing::debug!(
@@ -394,7 +400,7 @@ async fn main() {
             );
 
             // --- Per-second stats tick ---
-            if last_stats_tick.elapsed().as_secs() >= 1 {
+            if last_stats_tick.elapsed().as_secs() >= STATS_TICK_SECS {
                 let tps = events_this_second as f64;
                 if let Ok(mut s) = state.stats.lock() {
                     s.throughput_per_sec = tps;
@@ -403,12 +409,12 @@ async fn main() {
                 last_stats_tick    = Instant::now();
                 drift_tracker.update_stats(&state);
 
-                // Throughput spike detection — needs ≥10 baseline samples
+                // Throughput spike detection — needs ≥SPIKE_BASELINE_MIN_SAMPLES baseline samples
                 tps_history.push_back(tps);
-                if tps_history.len() > 60 { tps_history.pop_front(); }
-                if tps_history.len() >= 10 {
+                if tps_history.len() > TPS_HISTORY_LEN { tps_history.pop_front(); }
+                if tps_history.len() >= SPIKE_BASELINE_MIN_SAMPLES {
                     let baseline: f64 = tps_history.iter().sum::<f64>() / tps_history.len() as f64;
-                    if !spike_active && baseline > 5.0 && tps > baseline * 2.5 {
+                    if !spike_active && baseline > SPIKE_BASELINE_MIN_TPS && tps > baseline * SPIKE_RATIO {
                         spike_active = true;
                         tracing::warn!(
                             actor = "SYSTEM", evt = "THROUGHPUT_SPIKE",
@@ -416,7 +422,7 @@ async fn main() {
                             baseline = format_args!("{:.0}/s", baseline),
                             ratio = format_args!("{:.1}x", tps / baseline)
                         );
-                    } else if spike_active && tps < baseline * 1.5 {
+                    } else if spike_active && tps < baseline * SPIKE_RECOVERY_RATIO {
                         spike_active = false;
                         tracing::info!(
                             actor = "SYSTEM", evt = "THROUGHPUT_NORMAL",
@@ -427,8 +433,8 @@ async fn main() {
                 }
             }
 
-            // --- 30-second checkpoint ---
-            if last_checkpoint.elapsed().as_secs() >= 30 {
+            // --- Periodic checkpoint ---
+            if last_checkpoint.elapsed().as_secs() >= CHECKPOINT_INTERVAL_SECS {
                 last_checkpoint = Instant::now();
                 let (processed, misses, overflows, tps, buf, mode_str, preemptions, bot_rejections, human_drops) = {
                     let s = state.stats.lock().unwrap();
