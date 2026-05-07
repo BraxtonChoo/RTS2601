@@ -1,15 +1,20 @@
 // RTS2601 Criterion Benchmarks
 //
-// Benchmark group:
-//   pipeline_comparison — Async vs Threaded pipeline processing p50/p90/p99 (D2)
+// Benchmark groups:
+//   pipeline_comparison — Async vs Threaded scheduling drift p50/p90/p99
+//   sync_contention     — Mutex vs RwLock vs Atomic at 1/2/4/8/16 writer threads
 //
-// Removed:
-//   scheduling_drift  — replaced by the live dashboard sparkline (real simulation data)
-//   sync_contention   — replaced by the dashboard SYNC BENCHMARK panel (real simulation data)
+// NOTE — sync_contention is a controlled scalability experiment, not drawn from
+// the live simulation.  The simulation itself uses a single processor thread so
+// its leaderboard access is inherently serial; the dashboard SYNC BENCHMARK panel
+// shows those real per-event timings.  This benchmark answers a separate question:
+// "how does each primitive degrade as concurrent writers increase?" — which is the
+// academic comparison required by Component D.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -226,5 +231,142 @@ fn bench_pipeline_comparison(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_pipeline_comparison);
+// ============================================================
+// BENCHMARK: Sync Contention — Mutex vs RwLock vs Atomic (Component D)
+//
+// Each sub-benchmark spawns N writer threads, all updating the same shared
+// counter/leaderboard concurrently for 1 000 ops each.
+//
+// Thread counts: 1 / 2 / 4 / 8 / 16
+//   1  thread  → baseline (no contention)
+//   16 threads → high contention — gap between primitives widens most here
+//
+// Expected ranking: Atomic << RwLock < Mutex (gap grows with thread count)
+//
+// NOTE: This is a controlled microbenchmark.  The live simulation uses a single
+// processor thread (serial access), so the dashboard SYNC BENCHMARK panel shows
+// the real per-event cost.  This benchmark isolates lock-contention scaling.
+// ============================================================
+
+const OPS_PER_THREAD: usize = 1_000;
+
+// Stub leaderboard identical to the production one — avoids a crate dep
+struct ContendedLeaderboard {
+    counts: std::collections::HashMap<String, u64>,
+}
+
+impl ContendedLeaderboard {
+    fn new() -> Self { Self { counts: std::collections::HashMap::new() } }
+    fn update(&mut self, domain: &str) {
+        *self.counts.entry(domain.to_string()).or_insert(0) += 1;
+    }
+}
+
+fn bench_sync_contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync_contention");
+
+    // Print a summary table to stderr once before the timed iterations begin
+    // so the numbers appear in `cargo bench` terminal output alongside the
+    // Criterion confidence intervals.
+    {
+        eprintln!("\n===== Component D: Sync Contention — ns/op at increasing thread counts =====");
+        eprintln!("  {:>7}  {:>12}  {:>12}  {:>12}", "Threads", "Mutex", "RwLock", "Atomic");
+        for &n in &[1usize, 2, 4, 8, 16] {
+            // Mutex
+            let lb  = Arc::new(Mutex::new(ContendedLeaderboard::new()));
+            let t0  = Instant::now();
+            let hs: Vec<_> = (0..n).map(|_| {
+                let lb = Arc::clone(&lb);
+                thread::spawn(move || {
+                    for _ in 0..OPS_PER_THREAD { lb.lock().unwrap().update("en.wikipedia.org"); }
+                })
+            }).collect();
+            for h in hs { h.join().unwrap(); }
+            let mutex_ns = t0.elapsed().as_nanos() as f64 / (n * OPS_PER_THREAD) as f64;
+
+            // RwLock
+            let lb  = Arc::new(RwLock::new(ContendedLeaderboard::new()));
+            let t0  = Instant::now();
+            let hs: Vec<_> = (0..n).map(|_| {
+                let lb = Arc::clone(&lb);
+                thread::spawn(move || {
+                    for _ in 0..OPS_PER_THREAD { lb.write().unwrap().update("en.wikipedia.org"); }
+                })
+            }).collect();
+            for h in hs { h.join().unwrap(); }
+            let rwlock_ns = t0.elapsed().as_nanos() as f64 / (n * OPS_PER_THREAD) as f64;
+
+            // Atomic
+            let ctr = Arc::new(AtomicU64::new(0));
+            let t0  = Instant::now();
+            let hs: Vec<_> = (0..n).map(|_| {
+                let ctr = Arc::clone(&ctr);
+                thread::spawn(move || {
+                    for _ in 0..OPS_PER_THREAD { ctr.fetch_add(1, Ordering::Relaxed); }
+                })
+            }).collect();
+            for h in hs { h.join().unwrap(); }
+            let atomic_ns = t0.elapsed().as_nanos() as f64 / (n * OPS_PER_THREAD) as f64;
+
+            eprintln!(
+                "  {:>7}  {:>9.1} ns  {:>9.1} ns  {:>9.1} ns",
+                n, mutex_ns, rwlock_ns, atomic_ns
+            );
+        }
+        eprintln!("============================================================================\n");
+    }
+
+    // Criterion timed iterations — one group per primitive, parameterised by thread count
+    for &n in &[1usize, 2, 4, 8, 16] {
+
+        group.bench_with_input(BenchmarkId::new("Mutex", n), &n, |b, &n| {
+            b.iter(|| {
+                let lb = Arc::new(Mutex::new(ContendedLeaderboard::new()));
+                let handles: Vec<_> = (0..n).map(|_| {
+                    let lb = Arc::clone(&lb);
+                    thread::spawn(move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            lb.lock().unwrap().update("en.wikipedia.org");
+                        }
+                    })
+                }).collect();
+                for h in handles { h.join().unwrap(); }
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("RwLock", n), &n, |b, &n| {
+            b.iter(|| {
+                let lb = Arc::new(RwLock::new(ContendedLeaderboard::new()));
+                let handles: Vec<_> = (0..n).map(|_| {
+                    let lb = Arc::clone(&lb);
+                    thread::spawn(move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            lb.write().unwrap().update("en.wikipedia.org");
+                        }
+                    })
+                }).collect();
+                for h in handles { h.join().unwrap(); }
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("Atomic", n), &n, |b, &n| {
+            b.iter(|| {
+                let counter = Arc::new(AtomicU64::new(0));
+                let handles: Vec<_> = (0..n).map(|_| {
+                    let counter = Arc::clone(&counter);
+                    thread::spawn(move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                }).collect();
+                for h in handles { h.join().unwrap(); }
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_pipeline_comparison, bench_sync_contention);
 criterion_main!(benches);

@@ -117,9 +117,10 @@ pub struct RecentEvent {
 #[derive(Debug, Clone)]
 pub enum EventStatus {
     Processed,
-    BotEvicted,
-    BotDropped,
-    DeadlineMissed,
+    BotEvicted,      // buffer eviction  — bot kicked from queue to admit a human (Component A)
+    BotDropped,      // incoming bot dropped — channel full, no space                (Component A)
+    DeadlineMissed,  // event processed but exceeded 2ms deadline                   (Component C)
+    CompCBlocked,    // bot blocked at processing — domain's last edit was human     (Component C)
 }
 
 // ---------------------------------------------------------------------------

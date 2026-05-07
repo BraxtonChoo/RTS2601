@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};  // Instant kept for last_log / last_h_p99 tracking
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::channel::PriorityChannel;
 use crate::types::{EventStatus, PrioritisedEvent, PushResult, RecentEvent, SharedState};
@@ -194,28 +194,34 @@ pub fn schedule_event(
             );
         }
         PushResult::BotEvicted(evicted_seq, evicted_user) => {
-            // Incoming human admitted; oldest bot displaced
+            // Incoming human admitted; oldest bot displaced — Overflow Event
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
             tracing::warn!(
                 actor = %user, kind = "HUMAN", domain = %domain,
-                evt = "EVICTED", seq,
+                evt = "EVICTED", seq, timestamp_ns,
                 evicted_seq = evicted_seq, evicted_user = %evicted_user,
                 buf = format_args!("{}/{}", buf_fill, buf_cap)
             );
         }
         PushResult::DroppedIncoming => {
-            // Incoming bot dropped — channel full
+            // Incoming bot dropped — channel full — Overflow Event
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
             tracing::warn!(
                 actor = %user, kind = "BOT", domain = %domain,
-                evt = "DROPPED", seq,
+                evt = "DROPPED", seq, timestamp_ns,
                 reason = "bot_overflow",
                 buf = format_args!("{}/{}", buf_fill, buf_cap)
             );
         }
         PushResult::DroppedOldest(dropped_seq, dropped_user) => {
-            // All-human queue — oldest human displaced for incoming human
+            // All-human queue — oldest human displaced — Overflow Event
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
             tracing::warn!(
                 actor = %user, kind = "HUMAN", domain = %domain,
-                evt = "DROPPED", seq,
+                evt = "DROPPED", seq, timestamp_ns,
                 reason = "queue_full",
                 dropped_seq = dropped_seq, dropped_user = %dropped_user,
                 buf = format_args!("{}/{}", buf_fill, buf_cap)

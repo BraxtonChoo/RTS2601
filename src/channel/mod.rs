@@ -1,5 +1,5 @@
 // Component A: Bounded priority channel
-// Capacity 100. Human edits have highest priority; bots lowest.
+// Configured bounded capacity. Human edits have highest priority; bots lowest.
 // Emits [CHANNEL] log on every overflow decision and [BUFFER] log when fill
 // crosses 50 % / 80 % thresholds and when pressure eases below 40 %.
 
@@ -64,7 +64,14 @@ impl PriorityChannel {
     }
 
     pub fn pop(&mut self) -> Option<PrioritisedEvent> {
-        let item = self.buffer.pop_front();
+        // Execution-time priority: always dequeue a human before any bot,
+        // regardless of arrival order.  If no humans are waiting, fall back
+        // to the oldest bot (FIFO within each priority class).
+        let human_pos = self.buffer.iter().position(|e| !e.is_bot);
+        let item = match human_pos {
+            Some(pos) => self.buffer.remove(pos),
+            None      => self.buffer.pop_front(),
+        };
         if item.is_some() {
             self.check_ease();
         }

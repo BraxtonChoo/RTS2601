@@ -27,6 +27,8 @@ use scheduler::DriftTracker;
 use types::{EventStatus, PipelineMode, RecentEvent, SharedState, DRIFT_HISTORY_LEN};
 use watchdog::{start_watchdog, JitterMonitor};
 
+pub const CHANNEL_CAPACITY: usize = 100;
+
 // ---------------------------------------------------------------------------
 // CLI flag parsing
 // ---------------------------------------------------------------------------
@@ -163,12 +165,12 @@ async fn main() {
     let pipeline_mode = parse_pipeline_mode();
 
     let state       = Arc::new(SharedState::new(pipeline_mode));
-    let channel     = Arc::new(Mutex::new(PriorityChannel::new(100)));
+    let channel     = Arc::new(Mutex::new(PriorityChannel::new(CHANNEL_CAPACITY)));
     let leaderboard = Arc::new(Mutex::new(LeaderboardManager::new()));
 
     tracing::info!(
         actor = "SYSTEM", evt = "SESSION_START",
-        pipeline = %pipeline_mode, buffer = 100,
+        pipeline = %pipeline_mode, buffer = CHANNEL_CAPACITY,
         drift_deadline = "2ms", watchdog_timeout = "10s"
     );
 
@@ -367,7 +369,7 @@ async fn main() {
                     elapsed.as_secs() % 60
                 );
                 let status = if comp_c_blocked {
-                    EventStatus::BotEvicted   // reuse tag for feed display
+                    EventStatus::CompCBlocked
                 } else if deadline_missed {
                     EventStatus::DeadlineMissed
                 } else {
@@ -458,7 +460,7 @@ async fn main() {
                     tps = format_args!("{:.1}/s", tps),
                     miss_rate = format_args!("{:.1}%", miss_rate),
                     overflow_rate = format_args!("{:.1}%", overflow_rate),
-                    buf = format_args!("{}/100", buf),
+                    buf = format_args!("{}/{}", buf, CHANNEL_CAPACITY),
                     mode = %mode_str,
                     preemptions, bot_rejections, human_drops
                 );

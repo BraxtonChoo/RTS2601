@@ -18,6 +18,7 @@ use ratatui::{
     Terminal,
 };
 
+use crate::CHANNEL_CAPACITY;
 use crate::leaderboard::LeaderboardManager;
 use crate::types::{EventStatus, SharedState, DRIFT_HISTORY_LEN};
 
@@ -159,7 +160,7 @@ pub fn run_dashboard(
                 ])
                 .split(rows[2]);
 
-            let fill_pct = (stats.current_buffer_fill as f64 / 100.0 * 100.0) as u16;
+            let fill_pct = ((stats.current_buffer_fill as f64 / CHANNEL_CAPACITY as f64) * 100.0) as u16;
             let gauge_color = if fill_pct > 80 {
                 Color::Red
             } else if fill_pct > 50 {
@@ -172,7 +173,7 @@ pub fn run_dashboard(
                     .block(Block::default().title(" CHANNEL BUFFER ").borders(Borders::ALL))
                     .gauge_style(Style::default().fg(gauge_color))
                     .percent(fill_pct)
-                    .label(format!("{}/100", stats.current_buffer_fill)),
+                    .label(format!("{}/{}", stats.current_buffer_fill, CHANNEL_CAPACITY)),
                 row2[0],
             );
 
@@ -314,9 +315,10 @@ pub fn run_dashboard(
                         EventStatus::Processed => {
                             (if e.is_bot { Color::Gray } else { Color::Green }, "✓")
                         }
-                        EventStatus::BotEvicted     => (Color::Yellow,  "EVICTED"),
-                        EventStatus::BotDropped     => (Color::Red,     "DROPPED"),
-                        EventStatus::DeadlineMissed => (Color::Magenta, "MISS"),
+                        EventStatus::BotEvicted     => (Color::Yellow,  "EVICTED"), // A: bot kicked from buffer for human
+                        EventStatus::BotDropped     => (Color::Red,     "DROPPED"), // A: bot dropped at enqueue (full)
+                        EventStatus::DeadlineMissed => (Color::Magenta, "MISS"),    // C: 2ms deadline exceeded
+                        EventStatus::CompCBlocked   => (Color::Cyan,    "BLOCKED"), // C: domain human-protected
                     };
                     let kind = if e.is_bot { "BOT  " } else { "HUMAN" };
                     ListItem::new(Span::styled(
