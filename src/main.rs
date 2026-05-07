@@ -24,7 +24,7 @@ use crossbeam_channel::bounded;
 use channel::PriorityChannel;
 use leaderboard::LeaderboardManager;
 use scheduler::DriftTracker;
-use types::{EventStatus, PipelineMode, RecentEvent, SharedState};
+use types::{EventStatus, PipelineMode, RecentEvent, SharedState, DRIFT_HISTORY_LEN};
 use watchdog::{start_watchdog, JitterMonitor};
 
 // ---------------------------------------------------------------------------
@@ -33,13 +33,21 @@ use watchdog::{start_watchdog, JitterMonitor};
 fn parse_pipeline_mode() -> PipelineMode {
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len() {
-        if args[i] == "--pipeline" {
-            if let Some(val) = args.get(i + 1) {
-                return match val.to_lowercase().as_str() {
-                    "threaded" => PipelineMode::Threaded,
-                    _          => PipelineMode::Async,
-                };
+        match args[i].as_str() {
+            // --threaded  (shorthand flag)
+            "--threaded" => return PipelineMode::Threaded,
+            // --async     (shorthand flag)
+            "--async"    => return PipelineMode::Async,
+            // --pipeline threaded | --pipeline async
+            "--pipeline" => {
+                if let Some(val) = args.get(i + 1) {
+                    return match val.to_lowercase().as_str() {
+                        "threaded" => PipelineMode::Threaded,
+                        _          => PipelineMode::Async,
+                    };
+                }
             }
+            _ => {}
         }
     }
     PipelineMode::Async
@@ -95,46 +103,54 @@ fn print_summary(
         degraded_windows = s.degraded_activations
     );
 
-    // Human-readable terminal summary
-    println!("\n╔══════════════════════════════════════════════╗");
-    println!(  "║       RTS2601 — SESSION SUMMARY              ║");
-    println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  Pipeline:  {:5}                             ║", state.pipeline_mode);
-    println!(  "║  Runtime:   {:02}:{:02}:{:02}                ║", h, m, sec);
-    println!(  "║  Total events:   {:>8}                       ║", s.events_processed);
-    println!(  "║  Human edits:    {:>8}  ({:.1}%)             ║", s.human_events, h_pct);
-    println!(  "║  Bot edits:      {:>8}  ({:.1}%)             ║", s.bot_events,   b_pct);
-    println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  COMPONENT A — CHANNEL                       ║");
-    println!(  "║  OverflowEvents:  {:>6}                      ║", s.overflow_events);
-    println!(  "║  Bot evictions:   {:>6}                      ║", s.bot_evictions);
-    println!(  "║  Bot drops:       {:>6}                      ║", s.bot_drops);
-    println!(  "║  Human drops:     {:>6}                      ║", s.human_drops);
-    println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  COMPONENT C — SCHEDULING DRIFT              ║");
-    println!(  "║  (dequeue → task complete vs 2ms deadline)   ║");
-    println!(  "║  Human  p50: {:6.3}ms  p90: {:6.3}ms        ║", h50/1000.0, h90/1000.0);
-    println!(  "║         p99: {:6.3}ms  misses: {:>4}        ║", h99/1000.0, h_miss);
-    println!(  "║  Bot    p50: {:6.3}ms  p90: {:6.3}ms        ║", b50/1000.0, b90/1000.0);
-    println!(  "║         p99: {:6.3}ms  misses: {:>4}        ║", b99/1000.0, b_miss);
-    println!(  "║  C-Blocked: {:>6} (bot→human protected)    ║", s.comp_c_rejections);
-    println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  COMPONENT D — SYNC BENCHMARK (session avg)  ║");
-    println!(  "║  Mutex:   {:>8.0} ns                         ║", lb_avg_mutex);
-    println!(  "║  RwLock:  {:>8.0} ns                         ║", lb_avg_rwlock);
-    println!(  "║  Atomic:  {:>8.0} ns                         ║", lb_avg_atomic);
-    println!(  "║  Top-3 domains:                              ║");
+    // Human-readable terminal summary.
+    // BW = number of interior characters between the two ║ on every line.
+    // Every content line is: ║ {content:<BW-2} ║  (one space margin each side).
+    // The separator is ═ repeated BW times.
+    // Nothing is hardcoded to a column — format! builds the content string,
+    // then it gets padded to exactly BW-2 chars so the right ║ never drifts.
+    const BW: usize = 50;
+    let sep = || println!("╠{}╣", "═".repeat(BW));
+    let row = |content: String| println!("║ {:<width$} ║", content, width = BW - 2);
+
+    println!("\n╔{}╗", "═".repeat(BW));
+    row(format!("    RTS2601  —  SESSION SUMMARY"));
+    sep();
+    row(format!("  Pipeline:     {:<10}  Runtime: {:02}:{:02}:{:02}", state.pipeline_mode, h, m, sec));
+    row(format!("  Total events:   {:>8}", s.events_processed));
+    row(format!("  Human edits:    {:>8}  ({:.1}%)", s.human_events, h_pct));
+    row(format!("  Bot edits:      {:>8}  ({:.1}%)", s.bot_events,   b_pct));
+    sep();
+    row(format!("  COMPONENT A — CHANNEL"));
+    row(format!("  OverflowEvents:  {:>6}", s.overflow_events));
+    row(format!("  Bot evictions:   {:>6}", s.bot_evictions));
+    row(format!("  Bot drops:       {:>6}", s.bot_drops));
+    row(format!("  Human drops:     {:>6}", s.human_drops));
+    sep();
+    row(format!("  COMPONENT C — SCHEDULING DRIFT"));
+    row(format!("  (dequeue -> task complete vs 2ms deadline)"));
+    row(format!("  Human  p50:{:7.3}ms  p90:{:7.3}ms  p99:{:7.3}ms", h50/1000.0, h90/1000.0, h99/1000.0));
+    row(format!("         misses: {:>4}", h_miss));
+    row(format!("  Bot    p50:{:7.3}ms  p90:{:7.3}ms  p99:{:7.3}ms", b50/1000.0, b90/1000.0, b99/1000.0));
+    row(format!("         misses: {:>4}", b_miss));
+    row(format!("  C-Blocked: {:>6}  (bot->human protected)", s.comp_c_rejections));
+    sep();
+    row(format!("  COMPONENT D — SYNC BENCHMARK (session avg)"));
+    row(format!("  Mutex:   {:>8.0} ns", lb_avg_mutex));
+    row(format!("  RwLock:  {:>8.0} ns", lb_avg_rwlock));
+    row(format!("  Atomic:  {:>8.0} ns", lb_avg_atomic));
+    row(format!("  Top-3 domains:"));
     for (i, (domain, count)) in top3.iter().enumerate() {
-        println!("║    {}. {:20}  {:>6}                          ║", i+1, domain, count);
+        row(format!("    {}. {:<28}  {:>6}", i + 1, domain, count));
     }
-    println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  COMPONENT E — FAULT TOLERANCE               ║");
-    println!(  "║  Watchdog reconnects:   {:>4}                ║", s.reconnect_count);
-    println!(  "║  Degraded activations:  {:>4}                ║", s.degraded_activations);
-    println!(  "║  Total degraded time:   {:.1}s               ║", jitter.total_degraded_seconds());
-    println!(  "╠══════════════════════════════════════════════╣");
-    println!(  "║  D1: Deadline misses:   {:>6}                ║", s.deadline_misses);
-    println!(  "╚══════════════════════════════════════════════╝\n");
+    sep();
+    row(format!("  COMPONENT E — FAULT TOLERANCE"));
+    row(format!("  Watchdog reconnects:   {:>4}", s.reconnect_count));
+    row(format!("  Degraded activations:  {:>4}", s.degraded_activations));
+    row(format!("  Total degraded time:   {:.1}s", jitter.total_degraded_seconds()));
+    sep();
+    row(format!("  D1: Deadline misses:   {:>6}", s.deadline_misses));
+    println!("╚{}╝\n", "═".repeat(BW));
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +269,7 @@ async fn main() {
                 tracing::warn!(
                     actor = %event.user, kind = "BOT", domain = %event.domain,
                     evt = "DISCARDED", seq = event.seq,
+                    page = %event.title,
                     qwait = format_args!("{:.2}ms", queue_wait_ms),
                     sched_drift = format_args!("{:.3}ms", process_us / 1000.0),
                     reason = "degraded_mode"
@@ -294,6 +311,7 @@ async fn main() {
                 tracing::warn!(
                     actor = %event.user, kind = "BOT", domain = %event.domain,
                     evt = "BLOCKED", seq = event.seq,
+                    page = %event.title,
                     qwait = format_args!("{:.2}ms", queue_wait_ms),
                     sched_drift = format_args!("{:.3}ms", process_ms),
                     reason = "human_protected"
@@ -302,6 +320,7 @@ async fn main() {
                 tracing::warn!(
                     actor = %event.user, kind = %kind, domain = %event.domain,
                     evt = "DONE", seq = event.seq,
+                    page = %event.title,
                     qwait = format_args!("{:.2}ms", queue_wait_ms),
                     sched_drift = format_args!("{:.3}ms", process_ms),
                     deadline = "MISS",
@@ -311,6 +330,7 @@ async fn main() {
                 tracing::info!(
                     actor = %event.user, kind = %kind, domain = %event.domain,
                     evt = "DONE", seq = event.seq,
+                    page = %event.title,
                     qwait = format_args!("{:.2}ms", queue_wait_ms),
                     sched_drift = format_args!("{:.3}ms", process_ms)
                 );
@@ -326,6 +346,12 @@ async fn main() {
                 if event.is_bot { s.bot_events += 1; } else { s.human_events += 1; }
                 if deadline_missed   { s.deadline_misses   += 1; }
                 if comp_c_blocked    { s.comp_c_rejections += 1; }
+
+                // Drift sparkline — record every event (including C-blocked; they are near-zero)
+                s.drift_history.push_back(process_us as u64);
+                if s.drift_history.len() > DRIFT_HISTORY_LEN {
+                    s.drift_history.pop_front();
+                }
                 if !comp_c_blocked {
                     // Only refresh sync benchmark averages when a real update happened
                     s.avg_mutex_ns  = leaderboard.lock().unwrap().avg_mutex_ns();

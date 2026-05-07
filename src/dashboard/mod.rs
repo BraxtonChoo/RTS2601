@@ -12,13 +12,14 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, List, ListItem, Paragraph},
     Terminal,
 };
 
 use crate::leaderboard::LeaderboardManager;
-use crate::types::{EventStatus, SharedState};
+use crate::types::{EventStatus, SharedState, DRIFT_HISTORY_LEN};
 
 fn format_runtime(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
@@ -54,6 +55,7 @@ pub fn run_dashboard(
                     Constraint::Length(3),
                     Constraint::Length(9),
                     Constraint::Length(8),
+                    Constraint::Length(9),
                     Constraint::Min(0),
                 ])
                 .split(size);
@@ -230,7 +232,79 @@ pub fn run_dashboard(
                 row2[2],
             );
 
-            // --- Row 3: Live event feed ---
+            // --- Row 3: Scheduling drift line chart ---
+            // X-axis = event index in the rolling window (oldest → newest).
+            // Y-axis = scheduling drift in µs.
+            // Adaptive y-scale: floor 100µs so near-zero values still draw as a visible
+            // line; ceiling 10 000µs so extreme outliers don't squash everything else.
+            // A yellow horizontal reference line is drawn at 2000µs (the 2ms deadline)
+            // whenever it falls within the visible y-range.
+            let drift_data: Vec<u64> = stats.drift_history.iter().copied().collect();
+            let max_sample  = drift_data.iter().copied().max().unwrap_or(100);
+            let display_max = max_sample.clamp(100, 10_000) as f64;
+            let x_bound     = DRIFT_HISTORY_LEN as f64;
+            let line_color  = if stats.drift_p99 < 2.0 { Color::Green } else { Color::Red };
+
+            // Main drift line — connect every sample with Braille characters
+            let drift_points: Vec<(f64, f64)> = drift_data.iter().enumerate()
+                .map(|(i, &v)| (i as f64, v as f64))
+                .collect();
+
+            // 2ms deadline reference — horizontal yellow line (only drawn when in range)
+            let deadline_pts: Vec<(f64, f64)> = vec![(0.0, 2000.0), (x_bound, 2000.0)];
+
+            let mut datasets = vec![
+                Dataset::default()
+                    .name("drift µs")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(line_color))
+                    .data(&drift_points),
+            ];
+            if display_max >= 2000.0 {
+                datasets.push(
+                    Dataset::default()
+                        .name("2ms deadline")
+                        .marker(symbols::Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(Color::Yellow))
+                        .data(&deadline_pts),
+                );
+            }
+
+            let mid_label = format!("{:.0}", display_max / 2.0);
+            let max_label = format!("{:.0}", display_max);
+            let chart_title = format!(
+                " SCHED DRIFT (dequeue→done, µs)  total={} events  p99={:.0}µs  scale=0–{} ",
+                stats.events_processed,
+                stats.drift_p99 * 1000.0,
+                max_label,
+            );
+
+            f.render_widget(
+                Chart::new(datasets)
+                    .block(Block::default().title(chart_title).borders(Borders::ALL))
+                    .x_axis(
+                        Axis::default()
+                            .bounds([0.0, x_bound])
+                            .labels(vec![
+                                Span::styled("oldest", Style::default().fg(Color::DarkGray)),
+                                Span::styled("newest", Style::default().fg(Color::DarkGray)),
+                            ]),
+                    )
+                    .y_axis(
+                        Axis::default()
+                            .bounds([0.0, display_max])
+                            .labels(vec![
+                                Span::raw("0"),
+                                Span::styled(&mid_label, Style::default().fg(Color::DarkGray)),
+                                Span::styled(&max_label, Style::default().fg(Color::DarkGray)),
+                            ]),
+                    ),
+                rows[3],
+            );
+
+            // --- Row 4: Live event feed ---
             let feed_items: Vec<ListItem> = stats
                 .recent_events
                 .iter()
@@ -260,7 +334,7 @@ pub fn run_dashboard(
                         .title(" LIVE EVENT FEED (q to quit) ")
                         .borders(Borders::ALL),
                 ),
-                rows[3],
+                rows[4],
             );
         })?;
 

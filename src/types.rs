@@ -97,7 +97,13 @@ pub struct SystemStats {
     pub comp_c_rejections: u64,
 
     pub recent_events: VecDeque<RecentEvent>,
+
+    /// Rolling window of per-event scheduling drift in µs — drives the dashboard sparkline.
+    /// Capped at DRIFT_HISTORY_LEN samples; oldest sample is evicted when full.
+    pub drift_history: VecDeque<u64>,
 }
+
+pub const DRIFT_HISTORY_LEN: usize = 300;
 
 #[derive(Debug, Clone)]
 pub struct RecentEvent {

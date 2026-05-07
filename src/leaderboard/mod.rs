@@ -80,22 +80,8 @@ impl LeaderboardManager {
         self.last_editor_bot.get(domain).map(|&is_bot| !is_bot).unwrap_or(false)
     }
 
-    // Returns "NONE", "HUMAN(username)", or "BOT(username)" for ALLOWED/BLOCKED logs.
-    pub fn last_edit_info(&self, domain: &str) -> String {
-        match self.last_editor_bot.get(domain) {
-            None        => "NONE".to_string(),
-            Some(true)  => format!("BOT({})",   self.last_editor_user.get(domain).map(|s| s.as_str()).unwrap_or("-")),
-            Some(false) => format!("HUMAN({})", self.last_editor_user.get(domain).map(|s| s.as_str()).unwrap_or("-")),
-        }
-    }
-
-    // Returns the username of the last editor for a domain ("-" if unknown).
-    pub fn last_editor_name(&self, domain: &str) -> &str {
-        self.last_editor_user.get(domain).map(|s| s.as_str()).unwrap_or("-")
-    }
-
     // Returns (mutex_ns, rwlock_ns, atomic_ns).
-    // is_bot / user: recorded so last_was_human() / last_edit_info() work.
+    // is_bot / user: recorded so last_was_human() works.
     pub fn update_all(&mut self, domain: &str, is_bot: bool, user: &str) -> (u64, u64, u64) {
         let t = Instant::now();
         { self.mutex_lb.lock().unwrap().update(domain); }

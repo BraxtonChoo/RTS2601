@@ -57,9 +57,7 @@ pub fn run_threaded_pipeline(
             'inner: for line_result in reader.lines() {
                 if reconnect_rx.try_recv().is_ok() {
                     tracing::warn!(actor = "SYSTEM", evt = "RECONNECT_SIGNAL", pipeline = "threaded");
-                    if let Ok(mut s) = state.stats.lock() {
-                        s.reconnect_count += 1;
-                    }
+                    // reconnect_count already incremented by the watchdog before it sent the signal
                     break 'inner;
                 }
 
