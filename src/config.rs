@@ -10,7 +10,7 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of events the priority channel can hold.
-pub const CHANNEL_CAPACITY: usize = 100;
+pub const CHANNEL_CAPACITY: usize = 15;
 
 /// Buffer fill level (%) at which a BUFFER_50PCT warning is emitted.
 pub const BUFFER_WARN_PCT: usize = 50;
@@ -43,7 +43,6 @@ pub const DRIFT_DEADLINE: Duration = Duration::from_millis(2);
 pub const DRIFT_ALERT_PCT: f64 = 25.0;
 
 /// How often (seconds) the drift 10s log line is emitted.
-#[allow(dead_code)]
 pub const DRIFT_LOG_INTERVAL_SECS: u64 = 10;
 
 /// Rolling window of per-event drift samples kept for the dashboard chart (µs).

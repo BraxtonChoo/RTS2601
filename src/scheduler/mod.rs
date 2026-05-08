@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::channel::PriorityChannel;
+use crate::config::DRIFT_LOG_INTERVAL_SECS;
 use crate::types::{EventStatus, PrioritisedEvent, PushResult, RecentEvent, SharedState};
 
 static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -101,7 +102,7 @@ impl DriftTracker {
             s.drift_p99 = Self::percentile(&mut all, 99.0) / 1000.0;
         }
 
-        if self.last_log.elapsed() >= Duration::from_secs(10) {
+        if self.last_log.elapsed() >= Duration::from_secs(DRIFT_LOG_INTERVAL_SECS) {
             self.last_log = Instant::now();
 
             let h50 = Self::percentile(&mut self.human_samples, 50.0);
