@@ -37,7 +37,7 @@
 
 ### 1.1 Dual-Pipeline Implementation
 
-Both pipeline architectures connect to the same Wikimedia SSE endpoint, share the same bounded `PriorityChannel`, and communicate with the watchdog through the same crossbeam heartbeat and reconnect channels. The active pipeline is selected at startup via a CLI flag, keeping the benchmark comparison clean and unambiguous.
+Both pipelines connect to the same Wikipedia SSE endpoint, share the same bounded priority channel, and communicate with the watchdog through the same heartbeat and reconnect channels. The active pipeline is selected with a command-line flag at startup.
 
 ```bash
 cargo run --release                   # async pipeline (default)
@@ -50,7 +50,7 @@ cargo run --release -- --threaded     # std::thread pipeline
 
 **Overview**
 
-The async pipeline runs as a Tokio task. It connects to the Wikimedia SSE stream using `reqwest` and reads the response as a byte stream. Incoming bytes are accumulated in a string buffer until a newline is found, at which point the completed SSE line is parsed and pushed into the priority channel. All I/O suspension is handled cooperatively by the Tokio runtime without blocking any OS thread.
+`run_async_pipeline` connects to Wikipedia's live SSE stream as a Tokio task. Its role is to keep the connection alive, send heartbeat signals so the system knows the stream is active, and handle reconnections automatically when the connection drops or fails.
 
 ```rust
 // src/ingestion/async_pipeline.rs
@@ -194,9 +194,9 @@ pub const CONNECT_FAIL_BACKOFF: Duration = Duration::from_secs(5);
 pub const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 ```
 
-**Code Explanation**
+**Explanation**
 
-The async pipeline uses Tokio cooperative scheduling, which means the task yields control to the runtime whenever it is waiting for a network chunk. The 1-second `timeout` wrapper on each `stream.next()` call ensures the reconnect signal from the watchdog is checked at least once per second, preventing the task from blocking indefinitely on a stalled connection. The internal `buf` string accumulates partial SSE chunks across multiple receive calls and drains exactly one line at a time, ensuring no JSON events are split or dropped at chunk boundaries.
+When the function starts, it builds an HTTP client and attempts a connection to the stream. If the connection fails, it logs the error and waits briefly before retrying. Once connected, incoming data is collected in a buffer and scanned line by line for valid SSE content. Each valid event updates the heartbeat timestamp and is passed to the parser and scheduler. A 1-second timeout on each read ensures the reconnect signal is checked regularly, preventing the task from stalling on a silent connection. When an error or reconnect signal arrives, the loop breaks, pauses briefly, and then restarts.
 
 ---
 
@@ -204,7 +204,7 @@ The async pipeline uses Tokio cooperative scheduling, which means the task yield
 
 **Overview**
 
-The threaded pipeline runs in a dedicated OS thread spawned by `std::thread::spawn`. It uses the blocking `ureq` HTTP client with a `BufReader` to read the SSE stream line by line. The same bounded priority channel, `SharedState`, and crossbeam heartbeat/reconnect channels are used as in the async pipeline, making the two architectures directly comparable.
+`run_threaded_pipeline` serves the same role as the async pipeline - connecting to the Wikipedia SSE stream, sending heartbeats, and handling reconnections - but runs as a dedicated OS thread using blocking I/O instead. The stream is read line by line through a `BufReader`, which makes the control flow straightforward to follow.
 
 ```rust
 // src/ingestion/threaded_pipeline.rs
@@ -318,9 +318,9 @@ match pipeline_mode {
 }
 ```
 
-**Code Explanation**
+**Explanation**
 
-The threaded pipeline blocks the OS thread on `reader.lines()`, which internally calls `read()` on the TCP socket. This is simpler to reason about but consumes a dedicated OS thread for the lifetime of the connection. The reconnect signal is polled with `try_recv()` without blocking at the top of every line iteration, keeping the loop responsive. Both pipelines send the same heartbeat token on the same crossbeam channel, so the watchdog logic is completely independent of which pipeline is running.
+Unlike the async version, this pipeline blocks the OS thread on each read. The `BufReader` handles incoming bytes and delivers one complete line at a time, so there is no need to manually manage a buffer or scan for newlines. The reconnect signal is checked at the top of every loop iteration, so the pipeline stays responsive even while waiting for the next line. Both pipelines send heartbeats and handle reconnections in exactly the same way, which keeps the watchdog logic consistent regardless of which pipeline is active.
 
 ---
 
@@ -328,7 +328,7 @@ The threaded pipeline blocks the OS thread on `reader.lines()`, which internally
 
 **Overview**
 
-The system uses a bounded `PriorityChannel` backed by a `VecDeque` capped at `CHANNEL_CAPACITY` (100) slots. When the channel is full, one of three overflow outcomes occurs depending on whether the incoming event is a bot or a human. Every overflow outcome is logged as a structured Overflow Event with a nanosecond-precision Unix timestamp. Buffer fill levels are also monitored continuously, with warnings emitted when fill crosses 50% and 80%.
+`PriorityChannel` is a fixed-size queue that holds up to 100 events. When the queue is full, the outcome depends on whether the incoming event is from a bot or a human. Bots are rejected immediately, while humans are prioritised by evicting a buffered bot if one is available. The channel also monitors how full it is, logging warnings at 50% and 80% capacity.
 
 ```rust
 // src/channel/mod.rs
@@ -485,9 +485,9 @@ let (heartbeat_tx, heartbeat_rx) = bounded::<()>(HEARTBEAT_CHANNEL_CAP);
 let (reconnect_tx, reconnect_rx) = bounded::<()>(RECONNECT_CHANNEL_CAP);
 ```
 
-**Code Explanation**
+**Explanation**
 
-When a bot arrives at a full channel, it is rejected without any modification to the buffer. When a human arrives at a full channel, the system first searches for any buffered bot to evict and only discards the oldest human if no bots are present. The `enqueued_at` timestamp is stamped at the moment of successful entry into the buffer, not at parse time, ensuring the drift clock reflects actual time spent waiting in the channel. The `pressure_level` flag prevents duplicate warning emissions: `BUFFER_50PCT` fires once on the way up and will not fire again until the buffer has eased below 40% and re-crossed 50%. Each overflow log entry carries a `timestamp_ns` field from `SystemTime::now()` at nanosecond resolution, allowing burst analysis that the millisecond wall-clock timestamp cannot support.
+Each event receives a timestamp the moment it enters the queue, which is used later to measure how long it waited before being processed. When the queue reaches 80% full, a warning logs the exact number of human and bot events currently in the buffer. If the queue later drops below 40%, the pressure level resets so the warning can fire again on the next spike, preventing duplicate alerts during a sustained burst. For overflow events, a nanosecond-precision timestamp is recorded alongside the event details. This makes it possible to analyse short bursts of high load that a millisecond-level log would miss.
 
 ---
 
@@ -500,7 +500,7 @@ When a bot arrives at a full channel, it is rejected without any modification to
 
 **Overview**
 
-`WikiEvent<'a>` is a serde-deserialised struct whose string fields are borrowed slices pointing directly into the raw JSON buffer. No heap memory is allocated for string data during parsing. The `<'a>` lifetime parameter tells the compiler that every `WikiEvent` instance borrows from the buffer it was parsed from and cannot outlive it. Parsing is split into two phases: Phase 1 produces the zero-copy struct with zero allocations; Phase 2 converts the slices into owned `String` values with exactly three allocations so the event can be moved into the channel queue.
+`parse_event` turns a raw JSON string from the SSE stream into a structured event ready for queuing. It does this in two phases. In the first phase, `WikiEvent<'a>` reads string fields directly from the original buffer without copying any data to new memory. In the second phase, those fields are converted into owned strings so the event can be stored independently of the buffer. A custom memory counter tracks exactly how many allocations occur during the first phase.
 
 ```rust
 // src/parser/mod.rs
@@ -588,9 +588,9 @@ use allocator::CountingAllocator;
 static A: CountingAllocator = CountingAllocator;
 ```
 
-**Code Explanation**
+**Explanation**
 
-When serde deserialises into `WikiEvent<'a>`, it records the start offset and length of each string field within the existing buffer rather than allocating new memory and copying bytes. The three string fields cover all the string content needed from the JSON event, yet zero heap memory is allocated to hold them. The `ALLOC_COUNT` counter is sampled before and after the `serde_json::from_str` call. The difference is stored in the `allocs` field of every `PrioritisedEvent` and appears in the `PARSED` log line. A value of `allocs=0` in every log line is the empirical proof that Phase 1 allocates nothing.
+By pointing directly into the existing JSON buffer instead of copying strings to new memory, the parser avoids unnecessary allocation on every event. This matters in a high-throughput pipeline where thousands of events arrive per minute. The allocation counter is sampled before and after the parse call, and the difference is stored with the event. A count of zero in the log means Phase 1 truly allocated nothing. The second phase then creates exactly three owned strings, for user, domain, and title, which is the minimum needed to store the event independently of the buffer.
 
 ---
 
@@ -598,7 +598,7 @@ When serde deserialises into `WikiEvent<'a>`, it records the start offset and le
 
 **Overview**
 
-Priority is enforced at two distinct points. At enqueue time, bots arriving at a full channel are dropped and humans arriving at a full channel evict buffered bots. At dequeue time, the processor always pulls the next human from the buffer before any bot, regardless of arrival order. Additionally, in degraded mode, bot events are discarded immediately on dequeue without any processing. The combination of these three mechanisms ensures human edits consistently experience lower scheduling drift than bot edits.
+Priority is enforced at two points. At the queue level, `pop()` always retrieves a human edit before any bot, regardless of arrival order. At the processing level, when the system enters degraded mode under high load, bot events are discarded immediately after being dequeued, without going through the leaderboard update at all. Together these two rules ensure human edits consistently move through the pipeline faster than bot edits.
 
 ```rust
 // src/channel/mod.rs -- human-first dequeue
@@ -656,9 +656,9 @@ if degraded && event.is_bot {
 }
 ```
 
-**Code Explanation**
+**Explanation**
 
-The `pop()` scan iterates the buffer from front to back looking for any event where `is_bot` is false and removes it by index. This means a human that arrived after 50 bots is still processed next, reducing its total time from enqueue to processing completion. In degraded mode the discard happens before the leaderboard update, so it costs only the Ordering::Relaxed atomic load and avoids all mutex contention, protecting human-event throughput during high-load periods.
+The `pop()` function scans the queue from front to back and removes the first human event it finds by index. This means a human that arrived after fifty bots is still processed next. At the enqueue side, when the queue is full, a bot is always rejected or evicted to make room for an incoming human. In degraded mode, the discard happens before any lock is acquired, so it adds almost no overhead even when the system is already under pressure. As a result, human throughput is maintained regardless of load conditions.
 
 ---
 
@@ -666,7 +666,7 @@ The `pop()` scan iterates the buffer from front to back looking for any event wh
 
 **Overview**
 
-A strict 2ms completion deadline applies to each event from the moment it is dequeued until all processing is finalised. The clock starts at `pop()` and stops after the leaderboard update. Events that exceed the deadline are flagged as `deadline=MISS` in the log and counted in `deadline_misses`. The `DriftTracker` maintains separate sample vectors for human and bot events and emits periodic 10-second drift reports.
+Each event has a strict 2ms budget from the moment it is dequeued to the moment all processing is complete. A timer starts immediately after `pop()` and stops after the leaderboard update. Events that exceed the budget are flagged in the log as `deadline=MISS`. The `DriftTracker` collects these times separately for humans and bots and produces p50, p90, and p99 summaries every 10 seconds.
 
 ```rust
 // src/main.rs -- per-event deadline check
@@ -742,9 +742,9 @@ pub const DRIFT_DEADLINE_MS: f64 = 2.0;
 pub const DRIFT_DEADLINE: Duration = Duration::from_millis(2);
 ```
 
-**Code Explanation**
+**Explanation**
 
-The deadline clock uses `Instant::now()` immediately after `pop()` returns, before any lock acquisition or processing begins. This captures the full processing cost including mutex contention for the leaderboard update. The `drift_history` rolling window of 300 samples feeds the dashboard sparkline chart so deadline behaviour is visible in real time. The 2ms threshold is defined once in `config.rs` as `DRIFT_DEADLINE_MS` and all comparison logic imports it by name, so changing the deadline requires editing only one file.
+The timer starts before any lock is acquired, so it captures the full cost of processing including any wait for the leaderboard mutex. The 2ms threshold is defined once in `config.rs` and imported by name wherever it is used, so changing the deadline requires editing only one file. Deadline misses are counted separately from Component C blocks: a bot that is blocked by page protection is not counted as a miss, keeping the miss count focused on genuine timing violations. The rolling window of recent drift values feeds the live dashboard chart, giving a real-time view of whether the system is meeting its deadline.
 
 ---
 
@@ -757,7 +757,7 @@ The deadline clock uses `Instant::now()` immediately after `pop()` returns, befo
 
 **Overview**
 
-Human edits override bot edits at two layers. The channel's `pop()` always returns a human before any bot. Beyond that, the processor loop implements a page-level protection rule: if the most recent edit to a specific Wikipedia article was made by a human, any bot attempting to edit the same article is blocked from processing. The protection is keyed by article title so that a human editing one article does not affect bot processing on unrelated articles on the same domain.
+Human edits are protected at two levels. At the queue level, `pop()` always returns a human edit before any bot. Beyond this, if the most recent edit to a specific Wikipedia article was made by a human, any bot trying to edit the same article is blocked entirely. This check is per article title rather than per domain, so blocking a bot on one article has no effect on other articles on the same site.
 
 ```rust
 // src/channel/mod.rs -- execution-time human priority
@@ -834,9 +834,9 @@ pub enum EventStatus {
 }
 ```
 
-**Code Explanation**
+**Explanation**
 
-The check and the leaderboard update share the same `leaderboard.lock()` acquisition, making the read-modify-write atomic with no race condition between checking a page's protection status and recording a new editor. A page that has never been seen returns `false` from `last_was_human` so there is no restriction on first edit. When a bot is blocked, the `comp_c_blocked` flag skips the leaderboard update entirely and skips the deadline check, so blocked bots do not inflate miss counts. The dashboard live feed shows blocked bots with the tag `BLOCKED` in cyan, visually distinguishing them from `EVICTED` (yellow) and `DROPPED` (red) events.
+The protection check and the leaderboard update share the same lock acquisition, which means the read and write happen together with no gap where another thread could change the page's protection status in between. A page that has never been seen before returns unprotected, so the first edit to any article always goes through. When a bot is blocked, the leaderboard update is skipped entirely and the event is not counted as a deadline miss. The dashboard live feed shows blocked bots in cyan, visually distinguishing them from evictions in yellow and drops in red.
 
 ---
 
@@ -844,7 +844,7 @@ The check and the leaderboard update share the same `leaderboard.lock()` acquisi
 
 **Overview**
 
-Scheduling drift is measured as the time from when an event is dequeued to when all processing is complete. `DriftTracker` maintains separate sample lists for human and bot events and computes p50, p90, and p99 percentiles for each group. A periodic 10-second log line reports the latest percentiles with a trend arrow, and the session summary prints a side-by-side comparison demonstrating that human edits experience lower scheduling drift than bot edits.
+`DriftTracker` measures how long each event takes from the moment it leaves the queue to the moment processing is complete. It stores these times in separate lists for humans and bots, then computes p50, p90, and p99 for each group. Results are pushed to the live dashboard every second and logged every 10 seconds with a trend indicator showing whether latency is improving or getting worse.
 
 ```rust
 // src/scheduler/mod.rs -- DriftTracker full implementation
@@ -1000,9 +1000,9 @@ row(format!("  Bot    p50:{:7.3}ms  p90:{:7.3}ms  p99:{:7.3}ms", b50/1000.0, b90
 row(format!("         misses: {:>4}", b_miss));
 ```
 
-**Code Explanation**
+**Explanation**
 
-The percentile function sorts the accumulated samples in place and indexes directly into the sorted slice. Sorting on every call is acceptable here because drift reporting happens once per second at the stats tick, not on the hot path. The periodic 10-second log includes trend arrows to show whether latency is improving or deteriorating since the last report window. Human samples consistently produce lower p99 values than bot samples because the human-first dequeue mechanism reduces queue wait time for humans across the whole session.
+Sorting the sample list to compute percentiles happens at reporting time, not during event processing, so it adds no latency to the hot path. The trend indicator compares the current p99 to the previous 10-second window. For example, if p99 rises by more than 500 microseconds, the trend shows "up", giving early warning before latency reaches the miss threshold. Human samples consistently produce lower p99 values than bot samples because the human-first dequeue reduces total queue wait time. The session summary side-by-side comparison is the direct proof that priority scheduling produces a measurable difference in latency.
 
 ---
 
@@ -1015,7 +1015,7 @@ The percentile function sorts the accumulated samples in place and indexes direc
 
 **Overview**
 
-The leaderboard tracks edit counts per domain and maintains a live top-3 ranking. It is wrapped in `Arc<Mutex<LeaderboardManager>>` and shared between the processor loop and the dashboard thread. The processor updates it on every processed event; the dashboard reads it every 100ms. `SharedState` bundles all shared counters behind `Arc<Mutex<SystemStats>>` so every thread accesses the same live data.
+The leaderboard tracks edit counts per Wikipedia domain and maintains a live top-3 ranking. It is shared between the processor loop and the dashboard using `Arc<Mutex<>>`, which allows safe access from multiple threads. `SharedState` bundles all other shared data - including counters, flags, and the last heartbeat time - into one place so every thread works with the same live information.
 
 ```rust
 // src/leaderboard/mod.rs -- Leaderboard and LeaderboardManager
@@ -1102,9 +1102,9 @@ f.render_widget(
 );
 ```
 
-**Code Explanation**
+**Explanation**
 
-The leaderboard is wrapped in `Arc` so ownership can be shared across the processor loop thread, the dashboard thread, and the session summary without copying the data. The `Mutex` inside `Arc` serialises access so only one thread can read or write at a time. The `top3()` function on `LeaderboardManager` reads through the `RwLock` version of the leaderboard using a read lock, which allows multiple concurrent readers without waiting for the processor's write. The `degraded_mode` flag uses `Arc<AtomicBool>` rather than a mutex because it is a single boolean that only needs to be read atomically without locking.
+The `Arc` wrapper lets multiple threads hold a reference to the same leaderboard without copying any data. The `Mutex` inside ensures only one thread can read or write at a time, preventing corrupted state from concurrent writes. The dashboard reads the top-3 list through the `RwLock` version using a read lock, which allows multiple threads to read at the same time without waiting for the processor to finish writing. The `degraded_mode` flag uses an atomic boolean instead of a mutex because toggling a single flag does not need the broader protection a mutex provides.
 
 ---
 
@@ -1112,7 +1112,7 @@ The leaderboard is wrapped in `Arc` so ownership can be shared across the proces
 
 **Overview**
 
-Every processed event updates the domain leaderboard through all three sync primitives simultaneously and records the nanosecond cost of each. A rolling window of 1000 samples per primitive produces the live averages shown on the dashboard. The Criterion benchmark `sync_contention` isolates the scaling behaviour of each primitive under 1, 2, 4, 8, and 16 concurrent writer threads, providing quantitative proof of how each primitive degrades under contention.
+Every processed event runs the leaderboard update through all three synchronisation methods at once - `Mutex`, `RwLock`, and `AtomicU64` - and records the time each one takes in nanoseconds. A rolling average of the last 1000 samples per method is displayed live on the dashboard. The Criterion benchmark `sync_contention` then measures how each method scales from 1 to 16 concurrent writer threads.
 
 ```rust
 // src/leaderboard/mod.rs -- update_all: three primitives per event
@@ -1233,9 +1233,9 @@ fn bench_sync_contention(c: &mut Criterion) {
 }
 ```
 
-**Code Explanation**
+**Explanation**
 
-`Mutex` acquires an exclusive lock that blocks every other thread for the duration of the critical section. `RwLock` uses a write lock here which has similar exclusivity but adds overhead for tracking reader counts. `AtomicU64::fetch_add` with `Ordering::Relaxed` maps to a single hardware atomic instruction with no kernel involvement or context switching. At one thread all three show their uncontested baseline cost. As thread count increases to 16, `Mutex` and `RwLock` times grow steeply because threads spend most of their time blocked waiting for the lock. The `Atomic` time grows much more slowly because the CPU cache coherence protocol handles contention in hardware. The Criterion confidence intervals on each measurement make the differences statistically rigorous rather than anecdotal.
+At one thread, all three methods show their baseline cost without any contention. As thread count rises to 16, `Mutex` and `RwLock` times increase steeply because threads spend most of their time waiting for the lock to become free. `AtomicU64` scales much better because the hardware handles contention directly in the CPU cache without suspending any thread. For example, at 16 threads the atomic operation can be many times faster than the mutex. Criterion reports a confidence interval for each measurement, which makes the comparison statistically meaningful rather than based on a single run.
 
 ---
 
@@ -1248,7 +1248,7 @@ fn bench_sync_contention(c: &mut Criterion) {
 
 **Overview**
 
-A dedicated watchdog thread blocks on a crossbeam channel with a 10-second timeout. Every SSE data line received by the ingestion pipeline sends a heartbeat token on this channel. If no token arrives for 10 seconds, the watchdog increments the reconnect counter and signals the pipeline to drop its current connection and reconnect. Both the async and threaded pipelines poll the reconnect signal at the top of their inner loops.
+A watchdog thread runs independently from the ingestion pipeline. It waits on a channel for a heartbeat signal from the pipeline - every time a valid SSE event arrives, the pipeline sends a token on that channel. If no token arrives for 10 seconds, the watchdog concludes the stream has stalled, increments the reconnect counter, and signals the pipeline to drop its connection and start again.
 
 ```rust
 // src/watchdog/mod.rs -- watchdog thread
@@ -1358,9 +1358,9 @@ let (wd_color, wd_status, wd_detail) = if stats.degraded_mode {
 };
 ```
 
-**Code Explanation**
+**Explanation**
 
-The watchdog and the ingestion pipelines are fully decoupled through channels. The watchdog has no reference to the HTTP connection and the pipeline has no reference to the watchdog thread; they communicate only through bounded crossbeam channels. The reconnect channel has capacity 1 so a second timeout signal while the pipeline is already reconnecting is silently discarded rather than queuing. The dashboard derives the connection status independently from `last_heartbeat` rather than from the watchdog, giving the UI a real-time countdown to the next watchdog check that updates every 100ms.
+The watchdog and the ingestion pipeline communicate only through bounded channels, so neither holds a reference to the other. This keeps them fully independent - a change to one side does not affect the other. The reconnect channel has a capacity of one, so if the pipeline is already reconnecting when a second timeout fires, the extra signal is silently discarded rather than queued. The dashboard derives connection status independently from `last_heartbeat`, giving a live countdown to the next watchdog check that updates every 100ms without involving the watchdog thread at all.
 
 ---
 
@@ -1368,7 +1368,7 @@ The watchdog and the ingestion pipelines are fully decoupled through channels. T
 
 **Overview**
 
-`JitterMonitor` maintains a rolling window of the last `JITTER_WINDOW` (100) processing times in milliseconds. After every event, it computes the standard deviation of the window. When the standard deviation exceeds `JITTER_THRESHOLD_MS` (5ms), the `degraded_mode` atomic flag is set and the processor loop begins discarding all bot events on arrival without any leaderboard update. Recovery is fully automatic: when the standard deviation falls back at or below the threshold, the flag is cleared and a `DEGRADED_OFF` log event is emitted recording the duration and events affected.
+`JitterMonitor` watches for instability in processing times. It keeps the last 100 processing times and computes their standard deviation after every event. When the standard deviation exceeds 5ms, the system enters degraded mode and starts discarding all bot events immediately on dequeue. When the standard deviation drops back to 5ms or below, degraded mode ends automatically and a log entry records how long it lasted and how many events were affected.
 
 ```rust
 // src/watchdog/mod.rs -- JitterMonitor full implementation
@@ -1502,9 +1502,9 @@ pub const JITTER_WINDOW: usize = 100;
 pub const JITTER_MIN_SAMPLES: usize = 10;
 ```
 
-**Code Explanation**
+**Explanation**
 
-Standard deviation of processing time captures instability rather than average load. A mean that is low but highly variable indicates the processor is intermittently struggling, which is the correct condition for shedding load. The `JITTER_MIN_SAMPLES` guard prevents the system from entering degraded mode during the first few events when the window is nearly empty and variance would be unreliable. The `DEGRADED_OFF` log line records the exact duration of the degraded window, the number of bots shed, and the number of humans that processed uninterrupted, which is the proof-of-recovery the assignment requires. The `total_degraded_seconds()` method accumulates time across all degraded windows so the session summary can show the total degraded fraction of the session.
+Standard deviation captures instability better than an average because it rises when processing times become unpredictable, even if the mean stays low. The minimum sample guard prevents the system from reacting to noise right at startup when the window contains only a few data points. When degraded mode ends, the `DEGRADED_OFF` log records the exact duration, the number of bots discarded, and the number of humans that continued processing uninterrupted. This gives a clear audit trail of every degraded period. In conclusion, the session summary accumulates all degraded windows into a single total, making it easy to see what fraction of the session was spent under stress.
 
 ---
 
@@ -1517,7 +1517,7 @@ Standard deviation of processing time captures instability rather than average l
 
 **Overview**
 
-Replacing the global allocator with `CountingAllocator` means every heap allocation anywhere in the process increments `ALLOC_COUNT`. By sampling this counter immediately before and after `serde_json::from_str()`, the parser captures the exact number of allocations that occur during Phase 1. This value is stored in the `allocs` field of the event and appears in every `PARSED` log line. A consistent `allocs=0` across all log lines is empirical runtime proof that the zero-copy parsing hot path allocates nothing.
+`CountingAllocator` replaces the standard memory allocator for the entire process. Every heap allocation anywhere in the program increments a global atomic counter. By reading this counter immediately before and after the JSON parse step, the parser reports exactly how many allocations the parsing phase made. This count is stored in every event and written to the log, providing runtime proof of the zero-copy claim.
 
 ```rust
 // src/allocator.rs
@@ -1567,9 +1567,9 @@ tracing::info!(
 );
 ```
 
-**Code Explanation**
+**Explanation**
 
-The custom allocator delegates all actual memory operations to the system allocator unchanged, so it has no performance impact beyond the atomic increment. The counter uses `Ordering::Relaxed` because the only requirement is that the count is eventually observed, not that it is synchronised with other threads. The `saturating_sub` prevents underflow if a concurrent allocation occurred between the two reads. Every `PARSED` log line carrying `allocs=0` is a self-documenting proof point for the zero-copy claim that persists in the log file for the entire session.
+The custom allocator delegates all actual memory operations to the system allocator unchanged, so it has no impact on performance beyond one atomic increment per allocation. The counter uses relaxed ordering because it only needs to be accurate within the same thread between the two reads - no cross-thread synchronisation is required. For example, across a 10-minute session with tens of thousands of events, every `PARSED` log line carrying `allocs=0` collectively proves the zero-copy design held throughout the entire run.
 
 ---
 
@@ -1577,7 +1577,7 @@ The custom allocator delegates all actual memory operations to the system alloca
 
 **Overview**
 
-The Criterion benchmark `pipeline_comparison` simulates end-to-end event processing under both pipeline models using an inline priority channel that mirrors production logic. Both simulations use 500 events at 75% bot / 25% human ratio. The benchmark measures scheduling drift (dequeue to leaderboard update complete) and prints p50/p90/p99 for both models to stderr before the timed Criterion iterations begin.
+The Criterion benchmark `pipeline_comparison` runs both pipelines through the same workload of 500 events at a 75% bot, 25% human ratio. Each simulation uses an inline priority channel that mirrors the production push and pop logic. The benchmark measures scheduling drift for each pipeline and prints p50, p90, and p99 to the terminal before the timed iterations begin.
 
 ```rust
 // benches/rts_benchmarks.rs -- pipeline_comparison
@@ -1707,9 +1707,9 @@ fn bench_pipeline_comparison(c: &mut Criterion) {
 }
 ```
 
-**Code Explanation**
+**Explanation**
 
-Both simulations use the same `BenchChannel` struct that mirrors the production priority push and pop logic, so the benchmark measures a realistic workload rather than a trivial synthetic one. The `yield_now()` calls in both producer and consumer allow the runtime or OS scheduler to interleave them, reflecting real pipeline concurrency. The p50/p90/p99 table printed to stderr appears directly in `cargo bench` terminal output alongside the Criterion confidence intervals, giving a single unified view of the comparison. The async simulation uses `tokio::sync::Mutex` because async code must not block within an async context; the threaded simulation uses `std::sync::Mutex` because threads block normally.
+Both simulations share the same event generation and the same priority channel logic, so the only variable is whether Tokio tasks or OS threads handle the concurrency. The `yield_now()` calls in both producer and consumer allow the scheduler to interleave them, which reflects real pipeline conditions. The p50/p90/p99 table appears directly alongside the Criterion confidence intervals in the terminal output, giving a single unified view of the comparison. The async simulation uses `tokio::sync::Mutex` instead of `std::sync::Mutex` because blocking inside an async task would prevent other tasks from running.
 
 ---
 
@@ -1717,7 +1717,7 @@ Both simulations use the same `BenchChannel` struct that mirrors the production 
 
 **Overview**
 
-The system reports scheduling drift using three percentile levels rather than averages. p50 reflects typical behaviour, p90 captures elevated but not extreme cases, and p99 captures tail latency that affects the worst 1% of events. All three are tracked separately for human and bot events, updated every second to the dashboard, logged every 10 seconds with a trend indicator, and printed side-by-side in the session summary.
+The system tracks scheduling drift using three percentile levels: p50 for typical behaviour, p90 for elevated but not extreme cases, and p99 for tail latency affecting the worst 1% of events. All three are tracked separately for humans and bots, updated to the dashboard every second, logged every 10 seconds with a trend indicator, and printed side-by-side in the session summary.
 
 ```rust
 // src/scheduler/mod.rs -- percentile computation and periodic reporting
@@ -1762,9 +1762,9 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 }
 ```
 
-**Code Explanation**
+**Explanation**
 
-Averages hide tail behaviour. A system with mean latency of 0.5ms can still have p99 of 50ms if 1% of events are severely delayed. The three-percentile view shows the full shape of the latency distribution. The separation between human and bot p99 values is the quantitative proof that the priority scheduling mechanism produces measurable benefit: human p99 is consistently lower because the human-first dequeue reduces queue wait time. The trend arrows in the 10-second log line show direction of change since the previous window, giving operators early warning of deteriorating latency before it reaches the miss threshold.
+An average hides tail behaviour. A system with a mean of 0.5ms can still have a p99 of 50ms if a small number of events are severely delayed. By reporting all three percentiles, the report gives a complete picture of the latency distribution. The gap between human p99 and bot p99 is the direct evidence that priority scheduling works: humans experience lower tail latency because they are dequeued first. The trend arrows in the 10-second log give early warning of deteriorating latency, allowing the system state to be assessed even without looking at the dashboard.
 
 ---
 
@@ -1772,7 +1772,7 @@ Averages hide tail behaviour. A system with mean latency of 0.5ms can still have
 
 **Overview**
 
-The safety interlock system combines the jitter monitor and the watchdog into a two-layer defence. The jitter monitor responds to CPU load increases by entering degraded mode. The watchdog responds to network failures by triggering reconnection. Both are automatic with no operator intervention required, and both produce structured log evidence of activation and recovery.
+The system uses two independent safety mechanisms that work together. The jitter monitor detects CPU load instability and enters degraded mode to reduce processing pressure. The watchdog detects network failures and triggers reconnection. Both activate and recover automatically with no operator input required, and both produce structured log entries showing exactly when they activated, how long they lasted, and what effect they had.
 
 ```rust
 // src/watchdog/mod.rs -- full evaluate() showing both activation and recovery
@@ -1831,6 +1831,6 @@ row(format!("  Degraded activations:  {:>4}", s.degraded_activations));
 row(format!("  Total degraded time:   {:.1}s", jitter.total_degraded_seconds()));
 ```
 
-**Code Explanation**
+**Explanation**
 
-The `DEGRADED_ON` log proves that the system detected the timing violation and responded. The `DEGRADED_OFF` log proves the system recovered autonomously when load normalised. The `bots_discarded` count in the `DEGRADED_OFF` log shows how much load was shed during the degraded window. The `humans_unaffected` count proves that human-event throughput was maintained throughout. The `total_degraded_seconds()` value in the session summary allows the total fraction of session time spent in degraded mode to be computed, giving a single number that captures the overall health of the system across the entire run.
+The two mechanisms address different failure modes without overlap. A network failure triggers the watchdog regardless of CPU load, and a jitter spike triggers degraded mode regardless of network health. When degraded mode activates, the `DEGRADED_ON` log records the measured jitter level and the threshold that was crossed. When it ends, `DEGRADED_OFF` records the duration, the number of bots discarded, and the number of humans processed uninterrupted. Together these two log lines are the evidence that the system responded and recovered correctly. In conclusion, the session summary aggregates all reconnects, degraded activations, and total degraded time into one section, giving a concise fault tolerance audit for the entire session.
