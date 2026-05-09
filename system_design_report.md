@@ -204,7 +204,7 @@ When the function starts, it builds an HTTP client and attempts a connection to 
 
 **Overview**
 
-`run_threaded_pipeline` serves the same role as the async pipeline - connecting to the Wikipedia SSE stream, sending heartbeats, and handling reconnections - but runs as a dedicated OS thread using blocking I/O instead. The stream is read line by line through a `BufReader`, which makes the control flow straightforward to follow.
+`run_threaded_pipeline` serves the same role as the async pipeline, connecting to the Wikipedia SSE stream, sending heartbeats, and handling reconnections in the same way, but runs as a dedicated OS thread using blocking I/O instead. The stream is read line by line through a `BufReader`, which makes the control flow straightforward to follow.
 
 ```rust
 // src/ingestion/threaded_pipeline.rs
@@ -1015,7 +1015,7 @@ Sorting the sample list to compute percentiles happens at reporting time, not du
 
 **Overview**
 
-The leaderboard tracks edit counts per Wikipedia domain and maintains a live top-3 ranking. It is shared between the processor loop and the dashboard using `Arc<Mutex<>>`, which allows safe access from multiple threads. `SharedState` bundles all other shared data - including counters, flags, and the last heartbeat time - into one place so every thread works with the same live information.
+The leaderboard tracks edit counts per Wikipedia domain and maintains a live top-3 ranking. It is shared between the processor loop and the dashboard using `Arc<Mutex<>>`, which allows safe access from multiple threads. `SharedState` bundles all other shared data, including counters, flags, and the last heartbeat time, into one place so every thread works with the same live information.
 
 ```rust
 // src/leaderboard/mod.rs -- Leaderboard and LeaderboardManager
@@ -1112,7 +1112,7 @@ The `Arc` wrapper lets multiple threads hold a reference to the same leaderboard
 
 **Overview**
 
-Every processed event runs the leaderboard update through all three synchronisation methods at once - `Mutex`, `RwLock`, and `AtomicU64` - and records the time each one takes in nanoseconds. A rolling average of the last 1000 samples per method is displayed live on the dashboard. The Criterion benchmark `sync_contention` then measures how each method scales from 1 to 16 concurrent writer threads.
+Every processed event runs the leaderboard update through all three synchronisation methods at once: `Mutex`, `RwLock`, and `AtomicU64`. The time each one takes is recorded in nanoseconds. A rolling average of the last 1000 samples per method is displayed live on the dashboard. The Criterion benchmark `sync_contention` then measures how each method scales from 1 to 16 concurrent writer threads.
 
 ```rust
 // src/leaderboard/mod.rs -- update_all: three primitives per event
@@ -1248,7 +1248,7 @@ At one thread, all three methods show their baseline cost without any contention
 
 **Overview**
 
-A watchdog thread runs independently from the ingestion pipeline. It waits on a channel for a heartbeat signal from the pipeline - every time a valid SSE event arrives, the pipeline sends a token on that channel. If no token arrives for 10 seconds, the watchdog concludes the stream has stalled, increments the reconnect counter, and signals the pipeline to drop its connection and start again.
+A watchdog thread runs independently from the ingestion pipeline. It waits on a channel for a heartbeat signal from the pipeline, where every valid SSE event causes the pipeline to send a token. If no token arrives for 10 seconds, the watchdog concludes the stream has stalled, increments the reconnect counter, and signals the pipeline to drop its connection and start again.
 
 ```rust
 // src/watchdog/mod.rs -- watchdog thread
@@ -1360,7 +1360,7 @@ let (wd_color, wd_status, wd_detail) = if stats.degraded_mode {
 
 **Explanation**
 
-The watchdog and the ingestion pipeline communicate only through bounded channels, so neither holds a reference to the other. This keeps them fully independent - a change to one side does not affect the other. The reconnect channel has a capacity of one, so if the pipeline is already reconnecting when a second timeout fires, the extra signal is silently discarded rather than queued. The dashboard derives connection status independently from `last_heartbeat`, giving a live countdown to the next watchdog check that updates every 100ms without involving the watchdog thread at all.
+The watchdog and the ingestion pipeline communicate only through bounded channels, so neither holds a reference to the other. This keeps them fully independent, meaning a change to one side does not affect the other. The reconnect channel has a capacity of one, so if the pipeline is already reconnecting when a second timeout fires, the extra signal is silently discarded rather than queued. The dashboard derives connection status independently from `last_heartbeat`, giving a live countdown to the next watchdog check that updates every 100ms without involving the watchdog thread at all.
 
 ---
 
@@ -1569,7 +1569,7 @@ tracing::info!(
 
 **Explanation**
 
-The custom allocator delegates all actual memory operations to the system allocator unchanged, so it has no impact on performance beyond one atomic increment per allocation. The counter uses relaxed ordering because it only needs to be accurate within the same thread between the two reads - no cross-thread synchronisation is required. For example, across a 10-minute session with tens of thousands of events, every `PARSED` log line carrying `allocs=0` collectively proves the zero-copy design held throughout the entire run.
+The custom allocator delegates all actual memory operations to the system allocator unchanged, so it has no impact on performance beyond one atomic increment per allocation. The counter uses relaxed ordering because it only needs to be accurate within the same thread between the two reads, with no cross-thread synchronisation required. For example, across a 10-minute session with tens of thousands of events, every `PARSED` log line carrying `allocs=0` collectively proves the zero-copy design held throughout the entire run.
 
 ---
 

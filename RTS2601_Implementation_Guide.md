@@ -59,45 +59,45 @@ cargo bench                           # Criterion benchmarks
 ┌──────────────────────────────────────────────────────────────────────┐
 │                          RTS2601 Process                             │
 │                                                                      │
-│  ┌────────────────────────────┐    ┌──────────────────────────────┐ │
-│  │    Ingestion Pipeline      │    │       Watchdog (E)           │ │
-│  │    Component A / B         │───▶│  10s heartbeat timeout       │ │
-│  │                            │    │  jitter → degraded mode      │ │
-│  │  Async  (Tokio + reqwest)  │◀───│  reconnect_tx on timeout     │ │
-│  │    OR                      │    └──────────────────────────────┘ │
-│  │  Threaded (std + ureq)     │                                     │
-│  └─────────────┬──────────────┘                                     │
-│                │  parse_event() — WikiEvent<'a> → PrioritisedEvent  │
+│  ┌────────────────────────────┐     ┌──────────────────────────────┐ │
+│  │    Ingestion Pipeline      │     │       Watchdog (E)           │ │
+│  │    Component A / B         │───> │  10s heartbeat timeout       │ │
+│  │                            │     │  jitter → degraded mode      │ │
+│  │  Async  (Tokio + reqwest)  │<─── │  reconnect_tx on timeout     │ │
+│  │    OR                      │      ──────────────────────────────┘ │
+│  │  Threaded (std + ureq)     │                                      │
+│  └─────────────┬──────────────┘                                      │
+│                │   parse_event() — WikiEvent<'a> → PrioritisedEvent  │
 │                ▼                                                     │
-│  ┌─────────────────────────────┐                                    │
-│  │    PriorityChannel (A)      │  bounded 100 slots                 │
-│  │    push(): priority enqueue │  evict bot → admit human           │
-│  │    pop():  human-first scan │  human dequeued before any bot     │
-│  └─────────────┬───────────────┘                                    │
-│                │  pop()                                             │
+│  ┌─────────────────────────────┐                                     │
+│  │    PriorityChannel (A)      │   bounded predefined slots          │
+│  │    push(): priority enqueue │   evict bot → admit human           │
+│  │    pop():  human-first scan │   human dequeued before any bot     │
+│  └─────────────┬───────────────┘                                     │
+│                │  pop()                                              │
 │                ▼                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │               Processor Loop  (main.rs)                      │  │
-│  │                                                              │  │
-│  │  degraded?       → discard bots immediately                  │  │
-│  │  comp_c check?   → block bot if page last edited by human    │  │
-│  │  drift clock     → measure dequeue → done vs 2 ms deadline   │  │
-│  │  jitter feed     → JitterMonitor for degraded detection      │  │
-│  └────┬─────────────────┬──────────────────────┬───────────────┘  │
-│       │                 │                      │                   │
-│       ▼                 ▼                      ▼                   │
-│  ┌──────────┐   ┌──────────────┐       ┌────────────┐             │
-│  │  Drift   │   │ Leaderboard  │       │SharedState │             │
-│  │ Tracker  │   │ Manager (D)  │       │stats / feed│             │
-│  │ (C)      │   │Mutex/RwLock  │       │            │             │
-│  │ p50/90/99│   │/Atomic bench │       │            │             │
-│  └──────────┘   └──────────────┘       └─────┬──────┘             │
-│                                              │                    │
-│                                              ▼                    │
-│                                       ┌───────────┐              │
-│                                       │ Dashboard │              │
-│                                       │ (ratatui) │              │
-│                                       └───────────┘              │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │                 Processor Loop  (main.rs)                      │  │
+│  │                                                                │  │
+│  │    degraded?       → discard bots immediately                  │  │
+│  │    comp_c check?   → block bot if page last edited by human    │  │
+│  │    drift clock     → measure dequeue → done vs 2 ms deadline   │  │
+│  │    jitter feed     → JitterMonitor for degraded detection      │  │
+│  └───────┬────────────────┬──────────────────────┬────────────────┘  │
+│          │                │                      │                   │
+│          ▼                ▼                      ▼                   │
+│     ┌──────────┐   ┌──────────────┐       ┌────────────┐             │
+│     │  Drift   │   │ Leaderboard  │       │SharedState │             │
+│     │ Tracker  │   │ Manager (D)  │       │stats / feed│             │
+│     │ (C)      │   │Mutex/RwLock  │       │            │             │
+│     │ p50/90/99│   │/Atomic bench │       │            │             │
+│     └──────────┘   └──────────────┘       └─────┬──────┘             │
+│                                                 │                    │
+│                                                 ▼                    │
+│                                           ┌───────────┐              │
+│                                           │ Dashboard │              │
+│                                           │ (ratatui) │              │
+│                                           └───────────┘              │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

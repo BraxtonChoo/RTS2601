@@ -1,9 +1,9 @@
 // Component D: Leaderboard with three concurrent sync primitives
 // All three are updated on every event so timings are directly comparable.
 //
-// Component C extension: LeaderboardManager tracks the last editor type per domain.
-// last_was_human(domain) lets the processor loop reject bot edits that would
-// overwrite a human's most recent update to that domain.
+// Component C extension: LeaderboardManager tracks the last editor type per title.
+// last_was_human(title) lets the processor loop reject bot edits that would
+// overwrite a human's most recent update to that title.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};

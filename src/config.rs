@@ -10,7 +10,7 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of events the priority channel can hold.
-pub const CHANNEL_CAPACITY: usize = 15;
+pub const CHANNEL_CAPACITY: usize = 20;
 
 /// Buffer fill level (%) at which a BUFFER_50PCT warning is emitted.
 pub const BUFFER_WARN_PCT: usize = 50;
