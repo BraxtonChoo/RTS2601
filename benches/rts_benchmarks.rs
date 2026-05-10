@@ -13,8 +13,8 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 // ============================================================
 
 fn percentile(sorted: &[Duration], pct: f64) -> Duration {
-    if sorted.is_empty() { return Duration::ZERO; }
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
     let idx = ((pct / 100.0) * sorted.len() as f64) as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
@@ -31,16 +33,16 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 // Minimal in-bench event — no dependency on main crate types
 #[derive(Clone)]
 struct BenchEvent {
-    is_bot:      bool,
-    domain:      String,
+    is_bot: bool,
+    domain: String,
     enqueued_at: Instant,
 }
 
 fn make_events(n: usize) -> Vec<BenchEvent> {
     (0..n)
         .map(|i| BenchEvent {
-            is_bot:      i % 4 != 0,           // 75% bots, 25% humans (realistic ratio)
-            domain:      "en.wikipedia.org".to_string(),
+            is_bot: i % 4 != 0, // 75% bots, 25% humans (realistic ratio)
+            domain: "en.wikipedia.org".to_string(),
             enqueued_at: Instant::now(),
         })
         .collect()
@@ -48,13 +50,16 @@ fn make_events(n: usize) -> Vec<BenchEvent> {
 
 // Inline priority channel — mirrors production logic, no crate dependency
 struct BenchChannel {
-    buf:      VecDeque<BenchEvent>,
+    buf: VecDeque<BenchEvent>,
     capacity: usize,
 }
 
 impl BenchChannel {
     fn new(cap: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(cap), capacity: cap }
+        Self {
+            buf: VecDeque::with_capacity(cap),
+            capacity: cap,
+        }
     }
 
     fn push(&mut self, mut ev: BenchEvent) {
@@ -63,11 +68,19 @@ impl BenchChannel {
             self.buf.push_back(ev);
             return;
         }
-        if ev.is_bot { return; }
+        if ev.is_bot {
+            return;
+        }
         let bot_pos = self.buf.iter().position(|e| e.is_bot);
         match bot_pos {
-            Some(p) => { self.buf.remove(p); self.buf.push_back(ev); }
-            None    => { self.buf.pop_front(); self.buf.push_back(ev); }
+            Some(p) => {
+                self.buf.remove(p);
+                self.buf.push_back(ev);
+            }
+            None => {
+                self.buf.pop_front();
+                self.buf.push_back(ev);
+            }
         }
     }
 
@@ -81,7 +94,11 @@ struct BenchLeaderboard {
 }
 
 impl BenchLeaderboard {
-    fn new() -> Self { Self { counts: std::collections::HashMap::new() } }
+    fn new() -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+        }
+    }
     fn update(&mut self, domain: &str) {
         *self.counts.entry(domain.to_string()).or_insert(0) += 1;
     }
@@ -103,9 +120,9 @@ const N_EVENTS: usize = 500;
 fn run_async_simulation() -> Vec<Duration> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let channel     = Arc::new(tokio::sync::Mutex::new(BenchChannel::new(200)));
+        let channel = Arc::new(tokio::sync::Mutex::new(BenchChannel::new(200)));
         let leaderboard = Arc::new(tokio::sync::Mutex::new(BenchLeaderboard::new()));
-        let events      = make_events(N_EVENTS);
+        let events = make_events(N_EVENTS);
 
         let ch_prod = Arc::clone(&channel);
         let producer = tokio::spawn(async move {
@@ -127,7 +144,9 @@ fn run_async_simulation() -> Vec<Duration> {
                     lb_cons.lock().await.update(&e.domain);
                     latencies.push(t.elapsed());
                     processed += 1;
-                    if processed >= N_EVENTS { break; }
+                    if processed >= N_EVENTS {
+                        break;
+                    }
                 } else {
                     tokio::task::yield_now().await;
                 }
@@ -143,31 +162,37 @@ fn run_async_simulation() -> Vec<Duration> {
 }
 
 fn run_threaded_simulation() -> Vec<Duration> {
-    let channel     = Arc::new(Mutex::new(BenchChannel::new(200)));
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let channel = Arc::new(Mutex::new(BenchChannel::new(200)));
     let leaderboard = Arc::new(Mutex::new(BenchLeaderboard::new()));
-    let events      = make_events(N_EVENTS);
+    let events = make_events(N_EVENTS);
+    let done = Arc::new(AtomicBool::new(false));
 
     let ch_prod = Arc::clone(&channel);
+    let done_prod = Arc::clone(&done);
     let producer = thread::spawn(move || {
         for ev in events {
             ch_prod.lock().unwrap().push(ev);
             thread::yield_now();
         }
+        done_prod.store(true, Ordering::SeqCst);
     });
 
     let ch_cons = Arc::clone(&channel);
     let lb_cons = Arc::clone(&leaderboard);
+    let done_cons = Arc::clone(&done);
     let consumer = thread::spawn(move || {
         let mut latencies = Vec::with_capacity(N_EVENTS);
-        let mut processed = 0usize;
         loop {
             let ev = ch_cons.lock().unwrap().pop();
             if let Some(e) = ev {
                 let t = Instant::now();
                 lb_cons.lock().unwrap().update(&e.domain);
                 latencies.push(t.elapsed());
-                processed += 1;
-                if processed >= N_EVENTS { break; }
+            } else if done_cons.load(Ordering::SeqCst) {
+                // Producer is done and channel is empty — we're finished
+                break;
             } else {
                 thread::yield_now();
             }
@@ -183,10 +208,12 @@ fn run_threaded_simulation() -> Vec<Duration> {
 
 fn bench_pipeline_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline_comparison");
+    group.sample_size(100); // reduce from 100 to 50 samples
+    group.measurement_time(Duration::from_secs(5)); // reduce from 5s to 2s
 
     // Pre-compute percentiles once — these are the D2 proof numbers
     {
-        let async_lats    = run_async_simulation();
+        let async_lats = run_async_simulation();
         let threaded_lats = run_threaded_simulation();
         if !async_lats.is_empty() && !threaded_lats.is_empty() {
             eprintln!("\n===== D2: Pipeline Comparison — Scheduling Drift Percentiles =====");
@@ -256,7 +283,11 @@ struct ContendedLeaderboard {
 }
 
 impl ContendedLeaderboard {
-    fn new() -> Self { Self { counts: std::collections::HashMap::new() } }
+    fn new() -> Self {
+        Self {
+            counts: std::collections::HashMap::new(),
+        }
+    }
     fn update(&mut self, domain: &str) {
         *self.counts.entry(domain.to_string()).or_insert(0) += 1;
     }
@@ -270,42 +301,63 @@ fn bench_sync_contention(c: &mut Criterion) {
     // Criterion confidence intervals.
     {
         eprintln!("\n===== Component D: Sync Contention — ns/op at increasing thread counts =====");
-        eprintln!("  {:>7}  {:>12}  {:>12}  {:>12}", "Threads", "Mutex", "RwLock", "Atomic");
+        eprintln!(
+            "  {:>7}  {:>12}  {:>12}  {:>12}",
+            "Threads", "Mutex", "RwLock", "Atomic"
+        );
         for &n in &[1usize, 2, 4, 8, 16] {
             // Mutex
-            let lb  = Arc::new(Mutex::new(ContendedLeaderboard::new()));
-            let t0  = Instant::now();
-            let hs: Vec<_> = (0..n).map(|_| {
-                let lb = Arc::clone(&lb);
-                thread::spawn(move || {
-                    for _ in 0..OPS_PER_THREAD { lb.lock().unwrap().update("en.wikipedia.org"); }
+            let lb = Arc::new(Mutex::new(ContendedLeaderboard::new()));
+            let t0 = Instant::now();
+            let hs: Vec<_> = (0..n)
+                .map(|_| {
+                    let lb = Arc::clone(&lb);
+                    thread::spawn(move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            lb.lock().unwrap().update("en.wikipedia.org");
+                        }
+                    })
                 })
-            }).collect();
-            for h in hs { h.join().unwrap(); }
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
             let mutex_ns = t0.elapsed().as_nanos() as f64 / (n * OPS_PER_THREAD) as f64;
 
             // RwLock
-            let lb  = Arc::new(RwLock::new(ContendedLeaderboard::new()));
-            let t0  = Instant::now();
-            let hs: Vec<_> = (0..n).map(|_| {
-                let lb = Arc::clone(&lb);
-                thread::spawn(move || {
-                    for _ in 0..OPS_PER_THREAD { lb.write().unwrap().update("en.wikipedia.org"); }
+            let lb = Arc::new(RwLock::new(ContendedLeaderboard::new()));
+            let t0 = Instant::now();
+            let hs: Vec<_> = (0..n)
+                .map(|_| {
+                    let lb = Arc::clone(&lb);
+                    thread::spawn(move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            lb.write().unwrap().update("en.wikipedia.org");
+                        }
+                    })
                 })
-            }).collect();
-            for h in hs { h.join().unwrap(); }
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
             let rwlock_ns = t0.elapsed().as_nanos() as f64 / (n * OPS_PER_THREAD) as f64;
 
             // Atomic
             let ctr = Arc::new(AtomicU64::new(0));
-            let t0  = Instant::now();
-            let hs: Vec<_> = (0..n).map(|_| {
-                let ctr = Arc::clone(&ctr);
-                thread::spawn(move || {
-                    for _ in 0..OPS_PER_THREAD { ctr.fetch_add(1, Ordering::Relaxed); }
+            let t0 = Instant::now();
+            let hs: Vec<_> = (0..n)
+                .map(|_| {
+                    let ctr = Arc::clone(&ctr);
+                    thread::spawn(move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            ctr.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
                 })
-            }).collect();
-            for h in hs { h.join().unwrap(); }
+                .collect();
+            for h in hs {
+                h.join().unwrap();
+            }
             let atomic_ns = t0.elapsed().as_nanos() as f64 / (n * OPS_PER_THREAD) as f64;
 
             eprintln!(
@@ -318,49 +370,60 @@ fn bench_sync_contention(c: &mut Criterion) {
 
     // Criterion timed iterations — one group per primitive, parameterised by thread count
     for &n in &[1usize, 2, 4, 8, 16] {
-
         group.bench_with_input(BenchmarkId::new("Mutex", n), &n, |b, &n| {
             b.iter(|| {
                 let lb = Arc::new(Mutex::new(ContendedLeaderboard::new()));
-                let handles: Vec<_> = (0..n).map(|_| {
-                    let lb = Arc::clone(&lb);
-                    thread::spawn(move || {
-                        for _ in 0..OPS_PER_THREAD {
-                            lb.lock().unwrap().update("en.wikipedia.org");
-                        }
+                let handles: Vec<_> = (0..n)
+                    .map(|_| {
+                        let lb = Arc::clone(&lb);
+                        thread::spawn(move || {
+                            for _ in 0..OPS_PER_THREAD {
+                                lb.lock().unwrap().update("en.wikipedia.org");
+                            }
+                        })
                     })
-                }).collect();
-                for h in handles { h.join().unwrap(); }
+                    .collect();
+                for h in handles {
+                    h.join().unwrap();
+                }
             });
         });
 
         group.bench_with_input(BenchmarkId::new("RwLock", n), &n, |b, &n| {
             b.iter(|| {
                 let lb = Arc::new(RwLock::new(ContendedLeaderboard::new()));
-                let handles: Vec<_> = (0..n).map(|_| {
-                    let lb = Arc::clone(&lb);
-                    thread::spawn(move || {
-                        for _ in 0..OPS_PER_THREAD {
-                            lb.write().unwrap().update("en.wikipedia.org");
-                        }
+                let handles: Vec<_> = (0..n)
+                    .map(|_| {
+                        let lb = Arc::clone(&lb);
+                        thread::spawn(move || {
+                            for _ in 0..OPS_PER_THREAD {
+                                lb.write().unwrap().update("en.wikipedia.org");
+                            }
+                        })
                     })
-                }).collect();
-                for h in handles { h.join().unwrap(); }
+                    .collect();
+                for h in handles {
+                    h.join().unwrap();
+                }
             });
         });
 
         group.bench_with_input(BenchmarkId::new("Atomic", n), &n, |b, &n| {
             b.iter(|| {
                 let counter = Arc::new(AtomicU64::new(0));
-                let handles: Vec<_> = (0..n).map(|_| {
-                    let counter = Arc::clone(&counter);
-                    thread::spawn(move || {
-                        for _ in 0..OPS_PER_THREAD {
-                            counter.fetch_add(1, Ordering::Relaxed);
-                        }
+                let handles: Vec<_> = (0..n)
+                    .map(|_| {
+                        let counter = Arc::clone(&counter);
+                        thread::spawn(move || {
+                            for _ in 0..OPS_PER_THREAD {
+                                counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                        })
                     })
-                }).collect();
-                for h in handles { h.join().unwrap(); }
+                    .collect();
+                for h in handles {
+                    h.join().unwrap();
+                }
             });
         });
     }

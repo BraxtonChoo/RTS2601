@@ -34,8 +34,9 @@ pub async fn run_async_pipeline(
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        let response = match client
-            .get(SSE_URL)
+        // //connect to SSE endpoint with appropriate headers
+        let response = match client 
+            .get(SSE_URL) 
             .header("Accept", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .header("User-Agent", "rts2601/0.1 (student project; Rust/tokio)")
@@ -59,6 +60,7 @@ pub async fn run_async_pipeline(
 
         tracing::info!(actor = "SYSTEM", evt = "CONNECTED", pipeline = "async");
 
+        // read incomming bytes and builds them into a stream
         let mut stream      = response.bytes_stream();
         let mut buf         = String::new();
         let connect_time    = Instant::now();
@@ -70,6 +72,7 @@ pub async fn run_async_pipeline(
                 break 'inner;
             }
 
+            // one second timeout
             let chunk = match tokio::time::timeout(Duration::from_secs(1), stream.next()).await {
                 Ok(Some(result)) => result,
                 Ok(None) => {
@@ -111,6 +114,7 @@ pub async fn run_async_pipeline(
                                 attempt = 0; // reset for next disconnect cycle
                             }
 
+                            // passes each complete event to the parser
                             match parse_event(json) {
                                 Ok(event) => {
                                     schedule_event(event, &channel, &state);

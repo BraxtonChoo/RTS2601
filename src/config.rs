@@ -63,7 +63,7 @@ pub const LEADERBOARD_ROLLING_WINDOW: usize = 1_000;
 pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Processing jitter (std-dev, ms) above this → degraded mode ON.
-pub const JITTER_THRESHOLD_MS: f64 = 5.0;
+pub const JITTER_THRESHOLD_MS: f64 = 0.03;
 
 /// Number of recent processing-time samples kept by the jitter monitor.
 pub const JITTER_WINDOW: usize = 100;
